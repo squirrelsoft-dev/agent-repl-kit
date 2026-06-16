@@ -165,4 +165,4 @@ is intentionally I/O-free so the TS port can reuse the same shapes.
 
 ## License
 
-MIT OR Apache-2.0.
+MIT — see [LICENSE](LICENSE).
