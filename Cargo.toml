@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["crates/agent-repl-core", "crates/agent-repl"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/squirrelsoft/agent-repl-kit"
+
+[workspace.dependencies]
+agent-repl-core = { path = "crates/agent-repl-core", version = "0.1.0" }
+
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
+crossterm = "0.29"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
+pulldown-cmark = { version = "0.13", default-features = false }
+palette = { version = "0.7", default-features = false, features = ["std"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }

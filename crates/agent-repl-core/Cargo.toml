@@ -1,0 +1,16 @@
+[package]
+name = "agent-repl-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Token-driven theme, event model, and tool registry for the agent-repl renderer."
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[dependencies]
+palette = { workspace = true }
+serde = { workspace = true, optional = true }

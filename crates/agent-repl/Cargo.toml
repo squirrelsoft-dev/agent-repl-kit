@@ -1,0 +1,28 @@
+[package]
+name = "agent-repl"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Ratatui-based terminal REPL for coding agents. Drop in events, get a polished UI."
+
+[features]
+default = []
+serde = ["agent-repl-core/serde"]
+
+[dependencies]
+agent-repl-core = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true }
+pulldown-cmark = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+anyhow = { workspace = true }
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"
