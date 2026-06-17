@@ -3,7 +3,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use agent_repl_core::{Event, ToolCall};
+use agent_repl_core::{ApprovalChoice, ApprovalPrompt, Event, ToolCall};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::stream::ToolId;
@@ -14,6 +14,8 @@ pub(crate) enum Msg {
     AppendTool(ToolId, ToolCall),
     UpdateTool(ToolId, ToolCall),
     SetWorking(bool),
+    // looper bolt-on: show/hide a three-level approval prompt.
+    SetApproval(Option<ApprovalPrompt>),
 }
 
 /// Opaque handle to a tool block already in the stream. Used to update it
@@ -25,6 +27,10 @@ pub struct ReplHandle {
     pub(crate) tx: mpsc::UnboundedSender<Msg>,
     pub(crate) input_rx: Mutex<mpsc::UnboundedReceiver<String>>,
     pub(crate) next_id: AtomicU64,
+    // looper bolt-ons: Esc-abort signal + approval-choice delivery, both flowing
+    // from the renderer's key handler back to the driving task.
+    pub(crate) abort_rx: Mutex<mpsc::UnboundedReceiver<()>>,
+    pub(crate) approval_rx: Mutex<mpsc::UnboundedReceiver<ApprovalChoice>>,
 }
 
 impl std::fmt::Debug for ReplHandle {
@@ -83,5 +89,39 @@ impl ReplHandle {
         let _ = self.tx.send(Msg::SetWorking(false));
         let mut rx = self.input_rx.lock().await;
         rx.recv().await
+    }
+
+    // ---- looper bolt-ons --------------------------------------------------
+
+    /// Show a three-level approval prompt. While shown, `a/A/d` (and `1/2/3`)
+    /// resolve it; `Esc` aborts. The renderer keeps `working` semantics so Esc
+    /// maps to abort, not quit.
+    pub fn request_approval(&self, prompt: ApprovalPrompt) {
+        let _ = self.tx.send(Msg::SetApproval(Some(prompt)));
+    }
+
+    /// Dismiss the approval prompt.
+    pub fn clear_approval(&self) {
+        let _ = self.tx.send(Msg::SetApproval(None));
+    }
+
+    /// Await the user's approval choice. `None` if the REPL exited.
+    pub async fn recv_approval(&self) -> Option<ApprovalChoice> {
+        let mut rx = self.approval_rx.lock().await;
+        rx.recv().await
+    }
+
+    /// Await an Esc-abort signal. `None` if the REPL exited.
+    pub async fn recv_abort(&self) -> Option<()> {
+        let mut rx = self.abort_rx.lock().await;
+        rx.recv().await
+    }
+
+    /// Drop any abort signals queued before a turn started, so a stale Esc
+    /// can't abort the next turn.
+    pub fn drain_abort(&self) {
+        if let Ok(mut rx) = self.abort_rx.try_lock() {
+            while rx.try_recv().is_ok() {}
+        }
     }
 }

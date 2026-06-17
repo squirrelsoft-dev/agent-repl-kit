@@ -5,6 +5,7 @@
 #![warn(missing_debug_implementations)]
 
 pub mod app;
+pub mod approval;
 pub mod blocks;
 pub mod composer;
 pub mod decorations;

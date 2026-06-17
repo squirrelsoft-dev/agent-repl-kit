@@ -5,11 +5,13 @@
 
 #![warn(missing_debug_implementations)]
 
+pub mod approval;
 pub mod event;
 pub mod palette;
 pub mod theme;
 pub mod tools;
 
+pub use approval::{ApprovalChoice, ApprovalPrompt};
 pub use event::{
     AlertLevel, DiffKind, DiffLine, EntryType, Event, ListEntry, ReadLine, SearchGroup, SearchHit,
     SearchResult, ToolCall, ToolKind, ToolKindId, TodoItem, TodoState,

@@ -7,8 +7,9 @@
 use std::time::Duration;
 
 use agent_repl::{
-    AgentRepl, DiffKind, DiffLine, EntryType, Event, ListEntry, ReadLine, ReplHandle, SearchGroup,
-    SearchHit, SearchResult, Theme, TodoItem, TodoState, ToolCall, ToolKind,
+    AgentRepl, ApprovalChoice, ApprovalPrompt, DiffKind, DiffLine, EntryType, Event, ListEntry,
+    ReadLine, ReplHandle, SearchGroup, SearchHit, SearchResult, Theme, TodoItem, TodoState,
+    ToolCall, ToolKind,
 };
 use anyhow::Result;
 use tokio::time::sleep;
@@ -45,9 +46,28 @@ async fn main() -> Result<()> {
         handle.set_working(true);
         run_transcript(&handle).await;
         // Now flip to interactive mode: echo whatever the user types until
-        // they quit.
+        // they quit. Each message is gated behind the permissions box so the
+        // Yes / Always / No prompt is easy to see.
         loop {
             let Some(line) = handle.recv_input().await else { break };
+
+            handle.request_approval(ApprovalPrompt::new(
+                format!("run: {line}"),
+                Some("the agent wants to act on this message".into()),
+                Some("messages this session".into()),
+            ));
+            let approved = tokio::select! {
+                choice = handle.recv_approval() => {
+                    matches!(choice, Some(ApprovalChoice::Accept | ApprovalChoice::AcceptAll))
+                }
+                _ = handle.recv_abort() => false,
+            };
+            handle.clear_approval();
+            if !approved {
+                handle.emit(Event::assistant("Okay, I won't do that."));
+                continue;
+            }
+
             handle.set_working(true);
             handle.emit(Event::assistant(format!("got it: `{line}`")));
             tokio::time::sleep(Duration::from_millis(200)).await;

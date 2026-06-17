@@ -5,7 +5,7 @@ use std::io::{self, Stdout};
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
-use agent_repl_core::Theme;
+use agent_repl_core::{ApprovalChoice, ApprovalPrompt, Theme};
 use anyhow::Result;
 use crossterm::event::{self, Event as CtEvent, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -20,6 +20,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use tokio::sync::{mpsc, Mutex};
 
+use crate::approval as approval_box;
 use crate::composer::{render as composer_render, Composer, ComposerAction};
 use crate::decorations::Decorations;
 use crate::gallery;
@@ -51,6 +52,13 @@ pub struct AgentRepl {
     start: Instant,
     last_content_height: u16,
     last_viewport_height: u16,
+    // looper bolt-ons: Esc-abort + a pending approval prompt.
+    abort_tx: mpsc::UnboundedSender<()>,
+    approval_tx: mpsc::UnboundedSender<ApprovalChoice>,
+    working: bool,
+    approval: Option<ApprovalPrompt>,
+    // Highlighted option in the permissions box (↑↓ navigation).
+    approval_selected: usize,
 }
 
 impl std::fmt::Debug for AgentRepl {
@@ -69,10 +77,14 @@ impl AgentRepl {
     pub fn new(theme: Theme) -> (Self, ReplHandle) {
         let (tx, rx) = mpsc::unbounded_channel();
         let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (abort_tx, abort_rx) = mpsc::unbounded_channel();
+        let (approval_tx, approval_rx) = mpsc::unbounded_channel();
         let handle = ReplHandle {
             tx,
             input_rx: Mutex::new(input_rx),
             next_id: AtomicU64::new(1),
+            abort_rx: Mutex::new(abort_rx),
+            approval_rx: Mutex::new(approval_rx),
         };
         let app = Self {
             theme,
@@ -86,6 +98,11 @@ impl AgentRepl {
             start: Instant::now(),
             last_content_height: 0,
             last_viewport_height: 0,
+            abort_tx,
+            approval_tx,
+            working: false,
+            approval: None,
+            approval_selected: 0,
         };
         (app, handle)
     }
@@ -168,7 +185,15 @@ impl AgentRepl {
             Msg::Append(ev) => self.stream.push(ev),
             Msg::AppendTool(id, call) => self.stream.push_tool(id, call),
             Msg::UpdateTool(id, call) => self.stream.update_tool(id, call),
-            Msg::SetWorking(w) => self.composer.set_working(w),
+            Msg::SetWorking(w) => {
+                self.working = w;
+                self.composer.set_working(w);
+            }
+            Msg::SetApproval(a) => {
+                // A fresh prompt always starts with the first option (Yes) selected.
+                self.approval_selected = 0;
+                self.approval = a;
+            }
         }
     }
 
@@ -206,6 +231,58 @@ impl AgentRepl {
             return true;
         }
 
+        // looper bolt-on: Esc while the agent is working OR an approval prompt is
+        // up emits an ABORT signal instead of quitting. (Esc on an idle, empty
+        // composer still quits — that path is unchanged below.)
+        if matches!(code, KeyCode::Esc)
+            && !mods.contains(KeyModifiers::CONTROL)
+            && (self.working || self.approval.is_some())
+        {
+            let _ = self.abort_tx.send(());
+            return false;
+        }
+
+        // While the permissions box is up it owns the keyboard: ↑↓ (or j/k,
+        // Tab/BackTab) move the selection, Enter confirms it, and the y/a/n and
+        // 1/2/3 shortcuts resolve a choice directly. Every other key is swallowed.
+        if let Some(prompt) = self.approval.as_ref() {
+            // `options` returns an owned list, so the borrow of `self.approval`
+            // ends here and we're free to mutate `approval_selected` below.
+            let opts = approval_box::options(prompt);
+            let n = opts.len();
+            let mut chosen: Option<ApprovalChoice> = None;
+            match code {
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                    self.approval_selected = (self.approval_selected + n - 1) % n;
+                }
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                    self.approval_selected = (self.approval_selected + 1) % n;
+                }
+                KeyCode::Enter => chosen = Some(opts[self.approval_selected.min(n - 1)].0),
+                KeyCode::Char('y') | KeyCode::Char('Y') => chosen = Some(ApprovalChoice::Accept),
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    chosen = opts
+                        .iter()
+                        .find(|(c, _)| *c == ApprovalChoice::AcceptAll)
+                        .map(|(c, _)| *c);
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('d') => {
+                    chosen = Some(ApprovalChoice::Deny);
+                }
+                KeyCode::Char(c @ '1'..='9') => {
+                    let idx = c as usize - '1' as usize;
+                    if idx < n {
+                        chosen = Some(opts[idx].0);
+                    }
+                }
+                _ => {}
+            }
+            if let Some(c) = chosen {
+                let _ = self.approval_tx.send(c);
+            }
+            return false;
+        }
+
         // First chance: the composer.
         match self.composer.handle_key(code, mods) {
             ComposerAction::Consumed => return false,
@@ -213,6 +290,7 @@ impl AgentRepl {
                 // User sent a message. Mirror it into the stream as a user
                 // event, flip to working, and forward to recv_input().
                 self.stream.push(agent_repl_core::Event::user(text.clone()));
+                self.working = true;
                 self.composer.set_working(true);
                 let _ = self.input_tx.send(text);
                 return false;
@@ -261,19 +339,28 @@ impl AgentRepl {
         let area = frame.area();
         let composer_h = composer_render::required_height(&self.composer, &self.theme);
         let menu_h = composer_render::menu_height(&self.composer, &self.theme);
+        // The permissions box floats directly above the composer while a gate
+        // is pending; it claims zero rows otherwise.
+        let approval_h = self
+            .approval
+            .as_ref()
+            .map(approval_box::required_height)
+            .unwrap_or(0);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(1),
                 Constraint::Length(menu_h),
+                Constraint::Length(approval_h),
                 Constraint::Length(composer_h),
                 Constraint::Length(1),
             ])
             .split(area);
         let body_area = chunks[0];
         let menu_area = chunks[1];
-        let composer_area = chunks[2];
-        let status_area = chunks[3];
+        let approval_area = chunks[2];
+        let composer_area = chunks[3];
+        let status_area = chunks[4];
 
         let spinner_frame = spinner::frame_for(self.start.elapsed());
         let text = self.active().render(&self.theme, &self.deco, spinner_frame);
@@ -293,6 +380,15 @@ impl AgentRepl {
         frame.render_widget(paragraph.scroll((scroll, 0)), body_area);
 
         composer_render::render_menu(&self.composer, &self.theme, frame, menu_area);
+        if let Some(prompt) = self.approval.as_ref() {
+            approval_box::render(
+                prompt,
+                self.approval_selected,
+                &self.theme,
+                frame,
+                approval_area,
+            );
+        }
         composer_render::render(
             &self.composer,
             &self.theme,
@@ -305,6 +401,31 @@ impl AgentRepl {
 
     fn draw_status_bar(&self, frame: &mut Frame, area: Rect) {
         let p = &self.theme.palette;
+
+        // While the permissions box is up, the status bar carries the
+        // navigation hints (the choices themselves live in the box).
+        if self.approval.is_some() {
+            let line = Line::from(vec![
+                Span::styled(
+                    " \u{23F8} permission required  ".to_string(),
+                    fg(p.warning).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "\u{2191}\u{2193} select".to_string(),
+                    fg(p.text),
+                ),
+                Span::styled("  \u{23CE} confirm".to_string(), fg(p.text)),
+                Span::styled("  y/a/n shortcut".to_string(), fg(p.text)),
+                Span::styled("  \u{00B7} Esc abort".to_string(), fg(p.text_faint)),
+            ]);
+            frame.render_widget(
+                Paragraph::new(line)
+                    .style(Style::default().bg(color(p.bg_raised)).fg(color(p.text_dim))),
+                area,
+            );
+            return;
+        }
+
         let sep = Span::styled(" · ".to_string(), fg(p.text_faint));
         let view_label = match self.view {
             AppView::Live => "live",

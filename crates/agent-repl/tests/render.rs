@@ -4,9 +4,9 @@
 //! pipeline without requiring a real terminal.
 
 use agent_repl::{
-    blocks, gallery, stream::Stream, AlertLevel, Decorations, Density, DiffKind, DiffLine,
-    EntryType, Event, ListEntry, Mode, ReadLine, SearchGroup, SearchHit, SearchResult, Theme,
-    TodoItem, TodoState, ToolCall, ToolKind, ToolStyle, Vibe,
+    approval, blocks, gallery, stream::Stream, AlertLevel, ApprovalPrompt, Decorations, Density,
+    DiffKind, DiffLine, EntryType, Event, ListEntry, Mode, ReadLine, SearchGroup, SearchHit,
+    SearchResult, Theme, TodoItem, TodoState, ToolCall, ToolKind, ToolStyle, Vibe,
 };
 use ratatui::backend::TestBackend;
 use ratatui::widgets::{Paragraph, Wrap};
@@ -589,4 +589,68 @@ fn render_stream_with(
         out.push('\n');
     }
     out
+}
+
+// -----------------------------------------------------------------------------
+// permissions box
+// -----------------------------------------------------------------------------
+
+fn render_approval(prompt: &ApprovalPrompt, selected: usize, theme: &Theme) -> String {
+    let backend = TestBackend::new(72, approval::required_height(prompt));
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| approval::render(prompt, selected, theme, f, f.area()))
+        .unwrap();
+    let buf = terminal.backend().buffer().clone();
+    let mut out = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            out.push_str(buf[(x, y)].symbol());
+        }
+        out.push('\n');
+    }
+    out
+}
+
+#[test]
+fn permissions_box_shows_yes_always_and_no() {
+    let prompt = ApprovalPrompt::new(
+        "write_file(path=src/main.rs)",
+        Some("medium risk".into()),
+        Some("writes".into()),
+    );
+    let out = render_approval(&prompt, 0, &Theme::slate().dark().card().comfortable());
+    assert!(out.contains("permission required"), "missing title:\n{out}");
+    assert!(out.contains("write_file(path=src/main.rs)"), "missing prompt:\n{out}");
+    assert!(out.contains("medium risk"), "missing detail:\n{out}");
+    assert!(out.contains("Yes"), "missing Yes:\n{out}");
+    assert!(out.contains("Always"), "missing Always:\n{out}");
+    assert!(out.contains("No"), "missing No:\n{out}");
+    // The selected (Yes) row carries the ❯ marker.
+    assert!(out.contains('\u{276F}'), "missing selection marker:\n{out}");
+}
+
+#[test]
+fn permissions_box_hides_always_when_not_offered() {
+    let prompt = ApprovalPrompt::new("delete everything", None, None);
+    let opts = approval::options(&prompt);
+    assert_eq!(opts.len(), 2, "no accept-all should mean two options");
+    let out = render_approval(&prompt, 0, &Theme::ember().dark().card().comfortable());
+    assert!(out.contains("Yes"), "missing Yes:\n{out}");
+    assert!(out.contains("No"), "missing No:\n{out}");
+    assert!(!out.contains("Always"), "Always shown when not offered:\n{out}");
+}
+
+#[test]
+fn permissions_box_renders_across_every_vibe_and_mode() {
+    let prompt = ApprovalPrompt::new("run: cargo test", Some("low risk".into()), Some("tests".into()));
+    for &v in &[Vibe::Phosphor, Vibe::Slate, Vibe::Spectrum, Vibe::Ember] {
+        for &m in &[Mode::Dark, Mode::Light] {
+            let theme = Theme::new(v).with_mode(m).card();
+            for sel in 0..3 {
+                let out = render_approval(&prompt, sel, &theme);
+                assert!(out.contains("Yes") && out.contains("No"), "{v:?}/{m:?}:\n{out}");
+            }
+        }
+    }
 }
