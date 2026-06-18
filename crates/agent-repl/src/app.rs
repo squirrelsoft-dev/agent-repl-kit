@@ -5,7 +5,7 @@ use std::io::{self, Stdout};
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
-use agent_repl_core::{ApprovalChoice, ApprovalPrompt, Theme};
+use agent_repl_core::{ApprovalChoice, ApprovalPrompt, FormAnswers, Theme};
 use anyhow::Result;
 use crossterm::event::{self, Event as CtEvent, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -25,6 +25,7 @@ use crate::composer::{render as composer_render, Composer, ComposerAction};
 use crate::decorations::Decorations;
 use crate::gallery;
 use crate::handle::{Msg, ReplHandle};
+use crate::question::{QuestionAction, QuestionState};
 use crate::spinner;
 use crate::stream::Stream;
 use crate::style::{color, fg};
@@ -59,6 +60,9 @@ pub struct AgentRepl {
     approval: Option<ApprovalPrompt>,
     // Highlighted option in the permissions box (↑↓ navigation).
     approval_selected: usize,
+    // looper bolt-on: a tabbed question form + the channel its answers flow out.
+    questions: Option<QuestionState>,
+    answers_tx: mpsc::UnboundedSender<FormAnswers>,
 }
 
 impl std::fmt::Debug for AgentRepl {
@@ -79,12 +83,14 @@ impl AgentRepl {
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let (abort_tx, abort_rx) = mpsc::unbounded_channel();
         let (approval_tx, approval_rx) = mpsc::unbounded_channel();
+        let (answers_tx, answers_rx) = mpsc::unbounded_channel();
         let handle = ReplHandle {
             tx,
             input_rx: Mutex::new(input_rx),
             next_id: AtomicU64::new(1),
             abort_rx: Mutex::new(abort_rx),
             approval_rx: Mutex::new(approval_rx),
+            answers_rx: Mutex::new(answers_rx),
         };
         let app = Self {
             theme,
@@ -103,6 +109,8 @@ impl AgentRepl {
             working: false,
             approval: None,
             approval_selected: 0,
+            questions: None,
+            answers_tx,
         };
         (app, handle)
     }
@@ -194,6 +202,9 @@ impl AgentRepl {
                 self.approval_selected = 0;
                 self.approval = a;
             }
+            Msg::SetQuestions(form) => {
+                self.questions = form.map(QuestionState::new);
+            }
         }
     }
 
@@ -231,12 +242,12 @@ impl AgentRepl {
             return true;
         }
 
-        // looper bolt-on: Esc while the agent is working OR an approval prompt is
-        // up emits an ABORT signal instead of quitting. (Esc on an idle, empty
-        // composer still quits — that path is unchanged below.)
+        // looper bolt-on: Esc while the agent is working OR an approval prompt /
+        // question form is up emits an ABORT signal instead of quitting. (Esc on
+        // an idle, empty composer still quits — that path is unchanged below.)
         if matches!(code, KeyCode::Esc)
             && !mods.contains(KeyModifiers::CONTROL)
-            && (self.working || self.approval.is_some())
+            && (self.working || self.approval.is_some() || self.questions.is_some())
         {
             let _ = self.abort_tx.send(());
             return false;
@@ -279,6 +290,16 @@ impl AgentRepl {
             }
             if let Some(c) = chosen {
                 let _ = self.approval_tx.send(c);
+            }
+            return false;
+        }
+
+        // While the question form is up it owns the keyboard. The state machine
+        // handles tab/option navigation, selection, and freeform typing; a
+        // submit returns the answers, which we forward to the driving task.
+        if let Some(qs) = self.questions.as_mut() {
+            if let QuestionAction::Submit(answers) = qs.handle_key(code) {
+                let _ = self.answers_tx.send(answers);
             }
             return false;
         }
@@ -339,12 +360,17 @@ impl AgentRepl {
         let area = frame.area();
         let composer_h = composer_render::required_height(&self.composer, &self.theme);
         let menu_h = composer_render::menu_height(&self.composer, &self.theme);
-        // The permissions box floats directly above the composer while a gate
-        // is pending; it claims zero rows otherwise.
+        // The permissions box and question form both float directly above the
+        // composer while active; each claims zero rows otherwise.
         let approval_h = self
             .approval
             .as_ref()
             .map(approval_box::required_height)
+            .unwrap_or(0);
+        let questions_h = self
+            .questions
+            .as_ref()
+            .map(QuestionState::required_height)
             .unwrap_or(0);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -352,6 +378,7 @@ impl AgentRepl {
                 Constraint::Min(1),
                 Constraint::Length(menu_h),
                 Constraint::Length(approval_h),
+                Constraint::Length(questions_h),
                 Constraint::Length(composer_h),
                 Constraint::Length(1),
             ])
@@ -359,8 +386,9 @@ impl AgentRepl {
         let body_area = chunks[0];
         let menu_area = chunks[1];
         let approval_area = chunks[2];
-        let composer_area = chunks[3];
-        let status_area = chunks[4];
+        let questions_area = chunks[3];
+        let composer_area = chunks[4];
+        let status_area = chunks[5];
 
         let spinner_frame = spinner::frame_for(self.start.elapsed());
         let text = self.active().render(&self.theme, &self.deco, spinner_frame);
@@ -388,6 +416,9 @@ impl AgentRepl {
                 frame,
                 approval_area,
             );
+        }
+        if let Some(qs) = self.questions.as_ref() {
+            qs.render(&self.theme, frame, questions_area);
         }
         composer_render::render(
             &self.composer,
@@ -417,6 +448,23 @@ impl AgentRepl {
                 Span::styled("  \u{23CE} confirm".to_string(), fg(p.text)),
                 Span::styled("  y/a/n shortcut".to_string(), fg(p.text)),
                 Span::styled("  \u{00B7} Esc abort".to_string(), fg(p.text_faint)),
+            ]);
+            frame.render_widget(
+                Paragraph::new(line)
+                    .style(Style::default().bg(color(p.bg_raised)).fg(color(p.text_dim))),
+                area,
+            );
+            return;
+        }
+
+        // While the question form is up, the status bar carries its key hints.
+        if let Some(qs) = self.questions.as_ref() {
+            let line = Line::from(vec![
+                Span::styled(
+                    " \u{2370} question  ".to_string(),
+                    fg(p.accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(qs.status_hint(), fg(p.text)),
             ]);
             frame.render_widget(
                 Paragraph::new(line)

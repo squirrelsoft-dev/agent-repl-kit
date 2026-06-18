@@ -8,10 +8,14 @@
 pub mod approval;
 pub mod event;
 pub mod palette;
+pub mod question;
 pub mod theme;
 pub mod tools;
 
 pub use approval::{ApprovalChoice, ApprovalPrompt};
+pub use question::{
+    FormAnswers, Question, QuestionAnswer, QuestionForm, QuestionKind,
+};
 pub use event::{
     AlertLevel, DiffKind, DiffLine, EntryType, Event, ListEntry, ReadLine, SearchGroup, SearchHit,
     SearchResult, ToolCall, ToolKind, ToolKindId, TodoItem, TodoState,

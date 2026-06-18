@@ -3,7 +3,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use agent_repl_core::{ApprovalChoice, ApprovalPrompt, Event, ToolCall};
+use agent_repl_core::{ApprovalChoice, ApprovalPrompt, Event, FormAnswers, QuestionForm, ToolCall};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::stream::ToolId;
@@ -16,6 +16,8 @@ pub(crate) enum Msg {
     SetWorking(bool),
     // looper bolt-on: show/hide a three-level approval prompt.
     SetApproval(Option<ApprovalPrompt>),
+    // looper bolt-on: show/hide a tabbed question form.
+    SetQuestions(Option<QuestionForm>),
 }
 
 /// Opaque handle to a tool block already in the stream. Used to update it
@@ -31,6 +33,8 @@ pub struct ReplHandle {
     // from the renderer's key handler back to the driving task.
     pub(crate) abort_rx: Mutex<mpsc::UnboundedReceiver<()>>,
     pub(crate) approval_rx: Mutex<mpsc::UnboundedReceiver<ApprovalChoice>>,
+    // looper bolt-on: completed question-form answers flowing back.
+    pub(crate) answers_rx: Mutex<mpsc::UnboundedReceiver<FormAnswers>>,
 }
 
 impl std::fmt::Debug for ReplHandle {
@@ -108,6 +112,29 @@ impl ReplHandle {
     /// Await the user's approval choice. `None` if the REPL exited.
     pub async fn recv_approval(&self) -> Option<ApprovalChoice> {
         let mut rx = self.approval_rx.lock().await;
+        rx.recv().await
+    }
+
+    /// Show a tabbed question form. While shown the box owns the keyboard; the
+    /// user navigates tabs/options and submits, and `Esc` aborts (delivered via
+    /// [`Self::recv_abort`]). Empty forms are ignored. Pair with
+    /// [`Self::recv_answers`] to collect the result.
+    pub fn ask_questions(&self, form: QuestionForm) {
+        if form.questions.is_empty() {
+            return;
+        }
+        let _ = self.tx.send(Msg::SetQuestions(Some(form)));
+    }
+
+    /// Dismiss the question form.
+    pub fn clear_questions(&self) {
+        let _ = self.tx.send(Msg::SetQuestions(None));
+    }
+
+    /// Await the user's submitted answers. `None` if the REPL exited (e.g. the
+    /// user aborted with `Esc` and the form was cleared).
+    pub async fn recv_answers(&self) -> Option<FormAnswers> {
+        let mut rx = self.answers_rx.lock().await;
         rx.recv().await
     }
 

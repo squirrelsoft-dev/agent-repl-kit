@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use agent_repl::{
     AgentRepl, ApprovalChoice, ApprovalPrompt, DiffKind, DiffLine, EntryType, Event, ListEntry,
-    ReadLine, ReplHandle, SearchGroup, SearchHit, SearchResult, Theme, TodoItem, TodoState,
-    ToolCall, ToolKind,
+    Question, QuestionForm, ReadLine, ReplHandle, SearchGroup, SearchHit, SearchResult, Theme,
+    TodoItem, TodoState, ToolCall, ToolKind,
 };
 use anyhow::Result;
 use tokio::time::sleep;
@@ -45,6 +45,11 @@ async fn main() -> Result<()> {
         // Mark working while the scripted transcript plays.
         handle.set_working(true);
         run_transcript(&handle).await;
+
+        // Showcase the question box: a single-choice (+ Other) tab and a
+        // multi-select (+ custom) tab, which adds a trailing Submit tab.
+        ask_demo_questions(&handle).await;
+
         // Now flip to interactive mode: echo whatever the user types until
         // they quit. Each message is gated behind the permissions box so the
         // Yes / Always / No prompt is easy to see.
@@ -75,6 +80,51 @@ async fn main() -> Result<()> {
     });
 
     app.run().await
+}
+
+/// Pop the tabbed question box, wait for answers (or an Esc abort), and echo a
+/// summary back into the transcript.
+async fn ask_demo_questions(h: &ReplHandle) {
+    let form = QuestionForm::new(vec![
+        Question::single(
+            "Which database should we use?",
+            vec!["Postgres".into(), "MySQL".into(), "SQLite".into()],
+        )
+        .with_detail("the primary data store")
+        .with_other(),
+        Question::multi(
+            "Which features should I wire up?",
+            vec![
+                "Auth".into(),
+                "Billing".into(),
+                "Notifications".into(),
+                "Search".into(),
+            ],
+        )
+        .with_detail("toggle any number")
+        .with_freeform("Something else"),
+    ])
+    .with_intro("before I start");
+
+    h.ask_questions(form.clone());
+    let answers = tokio::select! {
+        a = h.recv_answers() => a,
+        _ = h.recv_abort() => None,
+    };
+    h.clear_questions();
+
+    match answers {
+        Some(answers) => {
+            let mut summary = String::from("Thanks \u{2014} here's what I noted:\n");
+            for (q, a) in form.questions.iter().zip(answers.answers.iter()) {
+                let val = a.describe(q).unwrap_or_else(|| "(skipped)".into());
+                summary.push_str(&format!("- **{}** {}\n", q.title, val));
+            }
+            h.emit(Event::assistant(summary));
+        }
+        None => h.emit(Event::assistant("No problem, I'll skip the questions for now.")),
+    }
+    sleep(Duration::from_millis(300)).await;
 }
 
 async fn run_transcript(h: &ReplHandle) {
