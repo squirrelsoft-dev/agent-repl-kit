@@ -1,6 +1,8 @@
 //! Composer rendering. Multi-line field with chip-styled `@tokens`, a
 //! slash / `@file` menu popup, footer with model pill + key hints.
 
+use std::time::Duration;
+
 use agent_repl_core::{Density, Theme, ToolStyle};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
@@ -9,8 +11,16 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::composer::state::{Composer, MenuKind};
-use crate::spinner;
+use crate::mascot::{Mascot, MascotState};
 use crate::style::{color, fg};
+
+/// What the composer needs to paint a mascot in its reserved right strip.
+#[derive(Debug)]
+pub struct MascotPaint<'a> {
+    pub mascot: &'a dyn Mascot,
+    pub state: MascotState,
+    pub elapsed: Duration,
+}
 
 /// Total rows the composer needs given the active theme. Grows with the
 /// buffer (capped at [`MAX_VISIBLE_LINES`]).
@@ -42,7 +52,7 @@ pub fn render(
     theme: &Theme,
     frame: &mut Frame,
     area: Rect,
-    spinner_frame: char,
+    mascot: Option<MascotPaint<'_>>,
 ) {
     let p = &theme.palette;
     let hue = p.accent;
@@ -78,8 +88,36 @@ pub fn render(
         height: 1,
     };
 
-    draw_field(composer, theme, frame, field_area, spinner_frame);
-    draw_footer(composer, theme, frame, footer_area, spinner_frame);
+    // Carve a right-hand strip for the mascot; the text gets the rest. Because
+    // the field renders into its own narrower rect, typed text is clipped at the
+    // strip and can never overdraw the mascot.
+    let reserved = composer
+        .reserved_right()
+        .min(field_area.width.saturating_sub(1));
+    let text_area = Rect { width: field_area.width - reserved, ..field_area };
+
+    if let Some(paint) = mascot {
+        let (w, _h) = paint.mascot.size();
+        let mw = w.min(reserved);
+        if mw > 0 {
+            // Right-align in the reserved strip, keeping a 1-col right margin off
+            // the border when the strip is wide enough (it is for `with_mascot`,
+            // which reserves width + gap). The remaining gap sits on the left,
+            // between the text and the mascot.
+            let margin = u16::from(reserved > mw);
+            let mascot_area = Rect {
+                x: field_area.x + field_area.width - mw - margin,
+                y: field_area.y,
+                width: mw,
+                height: field_area.height,
+            };
+            let lines = paint.mascot.render(paint.state, paint.elapsed, p);
+            frame.render_widget(Paragraph::new(Text::from(lines)), mascot_area);
+        }
+    }
+
+    draw_field(composer, theme, frame, text_area);
+    draw_footer(composer, theme, frame, footer_area);
 }
 
 pub fn render_menu(composer: &Composer, theme: &Theme, frame: &mut Frame, area: Rect) {
@@ -150,31 +188,16 @@ pub fn render_menu(composer: &Composer, theme: &Theme, frame: &mut Frame, area: 
 // field
 // -----------------------------------------------------------------------------
 
-fn draw_field(
-    composer: &Composer,
-    theme: &Theme,
-    frame: &mut Frame,
-    area: Rect,
-    spinner_frame: char,
-) {
+fn draw_field(composer: &Composer, theme: &Theme, frame: &mut Frame, area: Rect) {
     let p = &theme.palette;
-    let sigil_glyph = if composer.working {
-        spinner_frame.to_string()
-    } else {
-        "\u{276F}".to_string() // ❯
-    };
-    let sigil_style = if composer.working {
-        fg(p.warning).add_modifier(Modifier::BOLD)
-    } else {
-        fg(p.accent).add_modifier(Modifier::BOLD)
-    };
+    // The working state lives on its own line above the composer (see
+    // `AgentRepl::draw_working_line`); the field keeps its normal sigil and just
+    // hides its placeholder while the agent runs.
+    let sigil_glyph = "\u{276F}".to_string(); // ❯
+    let sigil_style = fg(p.accent).add_modifier(Modifier::BOLD);
     let pad_str = "  ".to_string();
     let continuation_str = "    ".to_string(); // 2 (pad) + 2 (sigil + space)
-    let placeholder = if composer.working {
-        "agent is working\u{2026}"
-    } else {
-        "Ask the agent to do something\u{2026}"
-    };
+    let placeholder = "Ask the agent to do something\u{2026}";
 
     let chip_style = Style::default()
         .fg(color(p.accent))
@@ -186,7 +209,7 @@ fn draw_field(
     let lines = composer.lines();
     let scroll_top = composer.scroll_top();
     let visible = area.height as usize;
-    let show_placeholder = composer.is_empty();
+    let show_placeholder = composer.is_empty() && !composer.working;
 
     let mut rows: Vec<Line<'static>> = Vec::with_capacity(visible);
     for vi in 0..visible {
@@ -272,50 +295,28 @@ fn render_line_with_chips(
 // footer
 // -----------------------------------------------------------------------------
 
-fn draw_footer(
-    composer: &Composer,
-    theme: &Theme,
-    frame: &mut Frame,
-    area: Rect,
-    spinner_frame: char,
-) {
+fn draw_footer(composer: &Composer, theme: &Theme, frame: &mut Frame, area: Rect) {
     let p = &theme.palette;
     let sep = Span::raw("  ".to_string());
 
-    let left_spans: Vec<Span<'static>> = if composer.working {
-        vec![
-            Span::raw("  ".to_string()),
-            Span::styled(
-                format!("{} ", spinner_frame),
-                fg(p.warning).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "Working\u{2026}".to_string(),
-                fg(p.text_dim).add_modifier(Modifier::ITALIC),
-            ),
-        ]
-    } else {
-        let pill_style = Style::default()
-            .fg(color(p.accent))
-            .bg(color(p.accent_soft))
-            .add_modifier(Modifier::BOLD);
-        let mut spans = vec![
-            Span::raw("  ".to_string()),
-            Span::styled(format!(" \u{25C7} {} ", composer.model), pill_style),
-        ];
-        if !composer.cwd.is_empty() {
-            spans.push(sep.clone());
-            spans.push(Span::styled(composer.cwd.clone(), fg(p.text_dim)));
-        }
-        if let Some(branch) = &composer.branch {
-            spans.push(sep.clone());
-            spans.push(Span::styled(
-                format!("\u{2387} {branch}"),
-                fg(p.text_dim),
-            ));
-        }
-        spans
-    };
+    // The context pill (model · cwd · branch) stays visible even while working;
+    // the working spinner lives on its own line above the composer.
+    let pill_style = Style::default()
+        .fg(color(p.accent))
+        .bg(color(p.accent_soft))
+        .add_modifier(Modifier::BOLD);
+    let mut left_spans: Vec<Span<'static>> = vec![
+        Span::raw("  ".to_string()),
+        Span::styled(format!(" \u{25C7} {} ", composer.model), pill_style),
+    ];
+    if !composer.cwd.is_empty() {
+        left_spans.push(sep.clone());
+        left_spans.push(Span::styled(composer.cwd.clone(), fg(p.text_dim)));
+    }
+    if let Some(branch) = &composer.branch {
+        left_spans.push(sep.clone());
+        left_spans.push(Span::styled(format!("\u{2387} {branch}"), fg(p.text_dim)));
+    }
 
     let right_text = if composer.working {
         "esc interrupt".to_string()
@@ -346,7 +347,3 @@ fn draw_footer(
         area,
     );
 }
-
-const _: fn() = || {
-    let _ = spinner::frame_for;
-};

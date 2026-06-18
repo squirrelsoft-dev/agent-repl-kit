@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use agent_repl_core::{ApprovalChoice, ApprovalPrompt, Event, FormAnswers, QuestionForm, ToolCall};
 use tokio::sync::{mpsc, Mutex};
 
+use crate::mascot::MascotState;
 use crate::stream::ToolId;
 
 #[derive(Debug)]
@@ -14,10 +15,12 @@ pub(crate) enum Msg {
     AppendTool(ToolId, ToolCall),
     UpdateTool(ToolId, ToolCall),
     SetWorking(bool),
-    // looper bolt-on: show/hide a three-level approval prompt.
+    // Show/hide a three-level approval prompt.
     SetApproval(Option<ApprovalPrompt>),
-    // looper bolt-on: show/hide a tabbed question form.
+    // Show/hide a tabbed question form.
     SetQuestions(Option<QuestionForm>),
+    // Set the mascot's expression.
+    SetMascotState(MascotState),
 }
 
 /// Opaque handle to a tool block already in the stream. Used to update it
@@ -29,11 +32,11 @@ pub struct ReplHandle {
     pub(crate) tx: mpsc::UnboundedSender<Msg>,
     pub(crate) input_rx: Mutex<mpsc::UnboundedReceiver<String>>,
     pub(crate) next_id: AtomicU64,
-    // looper bolt-ons: Esc-abort signal + approval-choice delivery, both flowing
-    // from the renderer's key handler back to the driving task.
+    // Esc-abort signal + approval-choice delivery, both flowing from the
+    // renderer's key handler back to the driving task.
     pub(crate) abort_rx: Mutex<mpsc::UnboundedReceiver<()>>,
     pub(crate) approval_rx: Mutex<mpsc::UnboundedReceiver<ApprovalChoice>>,
-    // looper bolt-on: completed question-form answers flowing back.
+    // Completed question-form answers flowing back.
     pub(crate) answers_rx: Mutex<mpsc::UnboundedReceiver<FormAnswers>>,
 }
 
@@ -86,6 +89,14 @@ impl ReplHandle {
         let _ = self.tx.send(Msg::SetWorking(working));
     }
 
+    /// Set the mascot's expression (e.g. `Coding`, `Testing`, `Success`). The
+    /// app also moves the mascot between `Idle` and `Thinking` automatically as
+    /// work starts and stops; this overrides it for richer states. No-op when no
+    /// mascot is attached.
+    pub fn set_mascot_state(&self, state: MascotState) {
+        let _ = self.tx.send(Msg::SetMascotState(state));
+    }
+
     /// Await the next line of user input. Returns `None` if the REPL has
     /// exited. Flips the composer to `working = false` while it waits so
     /// the prompt is responsive.
@@ -95,7 +106,7 @@ impl ReplHandle {
         rx.recv().await
     }
 
-    // ---- looper bolt-ons --------------------------------------------------
+    // ---- interaction surfaces (approval / questions / abort) --------------
 
     /// Show a three-level approval prompt. While shown, `a/A/d` (and `1/2/3`)
     /// resolve it; `Esc` aborts. The renderer keeps `working` semantics so Esc

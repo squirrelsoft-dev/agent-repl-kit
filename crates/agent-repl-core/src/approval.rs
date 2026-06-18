@@ -1,6 +1,6 @@
-//! Three-level approval prompt (Looper bolt-on — PR upstream candidate).
+//! Three-level approval prompt — accept / accept-for-all / deny.
 //!
-//! The event model had no way to surface an approval gate. This adds a small,
+//! The event model surfaces no approval gate on its own. This adds a small,
 //! renderer-agnostic prompt type plus the user's choice. The renderer shows a
 //! key-hint bar while a prompt is active; the driving task delivers the choice
 //! back through a channel (see `ReplHandle::recv_approval`).

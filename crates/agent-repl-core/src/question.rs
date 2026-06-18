@@ -1,4 +1,4 @@
-//! Agent-driven question form (Looper bolt-on — PR upstream candidate).
+//! Agent-driven question form — multi-tab questions with structured answers.
 //!
 //! Lets the agent ask the user one or more questions and collect structured
 //! answers. Two question shapes are supported:

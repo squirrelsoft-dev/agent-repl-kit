@@ -18,3 +18,17 @@ pub fn frame_for(elapsed: Duration) -> char {
     let i = (elapsed.as_millis() / 80) as usize % FRAMES.len();
     FRAMES[i]
 }
+
+/// Index of `frame` within [`FRAMES`] (0 if absent). Lets callers derive a
+/// phase from the same clock that already drives the spinner glyph — e.g. to
+/// pulse a tool's status dot in lockstep without threading the elapsed time.
+pub fn index_of(frame: char) -> usize {
+    FRAMES.iter().position(|&c| c == frame).unwrap_or(0)
+}
+
+/// A smooth breathing value in `0.0..=1.0` for the given spinner glyph: `0` at
+/// the start of the cycle, `1` at the midpoint, back to `0` — a cosine ease.
+pub fn pulse_for(frame: char) -> f32 {
+    let t = index_of(frame) as f32 / FRAMES.len() as f32;
+    0.5 - 0.5 * (t * std::f32::consts::TAU).cos()
+}

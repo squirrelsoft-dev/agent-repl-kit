@@ -16,21 +16,26 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::approval as approval_box;
+use crate::composer::render::MascotPaint;
 use crate::composer::{render as composer_render, Composer, ComposerAction};
 use crate::decorations::Decorations;
 use crate::gallery;
 use crate::handle::{Msg, ReplHandle};
+use crate::mascot::{Mascot, MascotState};
 use crate::question::{QuestionAction, QuestionState};
 use crate::spinner;
 use crate::stream::Stream;
 use crate::style::{color, fg};
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
+
+/// Blank columns kept between the input text and an attached mascot.
+const MASCOT_GAP: u16 = 2;
 
 /// Which stream is currently visible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,16 +58,19 @@ pub struct AgentRepl {
     start: Instant,
     last_content_height: u16,
     last_viewport_height: u16,
-    // looper bolt-ons: Esc-abort + a pending approval prompt.
+    // Esc-abort + a pending approval prompt.
     abort_tx: mpsc::UnboundedSender<()>,
     approval_tx: mpsc::UnboundedSender<ApprovalChoice>,
     working: bool,
     approval: Option<ApprovalPrompt>,
     // Highlighted option in the permissions box (↑↓ navigation).
     approval_selected: usize,
-    // looper bolt-on: a tabbed question form + the channel its answers flow out.
+    // A tabbed question form + the channel its answers flow out.
     questions: Option<QuestionState>,
     answers_tx: mpsc::UnboundedSender<FormAnswers>,
+    // Optional mascot drawn in the composer's right strip + its expression.
+    mascot: Option<Box<dyn Mascot>>,
+    mascot_state: MascotState,
 }
 
 impl std::fmt::Debug for AgentRepl {
@@ -111,6 +119,8 @@ impl AgentRepl {
             approval_selected: 0,
             questions: None,
             answers_tx,
+            mascot: None,
+            mascot_state: MascotState::Idle,
         };
         (app, handle)
     }
@@ -151,6 +161,35 @@ impl AgentRepl {
     /// Real apps can refresh this dynamically as the working tree changes.
     pub fn with_file_completions(mut self, files: Vec<String>) -> Self {
         self.composer.set_file_completions(files);
+        self
+    }
+
+    // ---- input-sizing + mascot builders ----
+
+    /// Force the input field to always show at least `n` rows (it still grows
+    /// with typed content up to the cap). Useful on its own, or set
+    /// automatically by [`Self::with_mascot`].
+    pub fn with_min_input_lines(mut self, n: usize) -> Self {
+        self.composer.set_min_visible_lines(n);
+        self
+    }
+
+    /// Reserve `cols` columns on the right of the input field. Typed text lays
+    /// out in the remaining width and can't draw into the strip — i.e. this caps
+    /// the input text width. Set automatically by [`Self::with_mascot`].
+    pub fn with_input_reserved_right(mut self, cols: u16) -> Self {
+        self.composer.set_reserved_right(cols);
+        self
+    }
+
+    /// Attach a [`Mascot`] drawn in the input's right strip. This reserves a
+    /// strip as wide as the mascot (plus a 2-column gap) and raises the input's
+    /// minimum height to the mascot's height, so text never collides with it.
+    pub fn with_mascot<M: Mascot + 'static>(mut self, mascot: M) -> Self {
+        let (w, h) = mascot.size();
+        self.composer.set_min_visible_lines(h as usize);
+        self.composer.set_reserved_right(w + MASCOT_GAP);
+        self.mascot = Some(Box::new(mascot));
         self
     }
 
@@ -196,6 +235,15 @@ impl AgentRepl {
             Msg::SetWorking(w) => {
                 self.working = w;
                 self.composer.set_working(w);
+                // Auto-drive the mascot: start working → Thinking (unless the
+                // driver already set a richer active state); stop → back to Idle.
+                if w {
+                    if self.mascot_state == MascotState::Idle {
+                        self.mascot_state = MascotState::Thinking;
+                    }
+                } else {
+                    self.mascot_state = MascotState::Idle;
+                }
             }
             Msg::SetApproval(a) => {
                 // A fresh prompt always starts with the first option (Yes) selected.
@@ -205,6 +253,7 @@ impl AgentRepl {
             Msg::SetQuestions(form) => {
                 self.questions = form.map(QuestionState::new);
             }
+            Msg::SetMascotState(state) => self.mascot_state = state,
         }
     }
 
@@ -242,8 +291,8 @@ impl AgentRepl {
             return true;
         }
 
-        // looper bolt-on: Esc while the agent is working OR an approval prompt /
-        // question form is up emits an ABORT signal instead of quitting. (Esc on
+        // Esc while the agent is working OR an approval prompt / question form
+        // is up emits an ABORT signal instead of quitting. (Esc on
         // an idle, empty composer still quits — that path is unchanged below.)
         if matches!(code, KeyCode::Esc)
             && !mods.contains(KeyModifiers::CONTROL)
@@ -372,6 +421,9 @@ impl AgentRepl {
             .as_ref()
             .map(QuestionState::required_height)
             .unwrap_or(0);
+        // A single "working" line sits directly above the composer while the
+        // agent runs (it replaces the old in-field + in-footer spinners).
+        let working_h: u16 = if self.working { 1 } else { 0 };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -379,6 +431,7 @@ impl AgentRepl {
                 Constraint::Length(menu_h),
                 Constraint::Length(approval_h),
                 Constraint::Length(questions_h),
+                Constraint::Length(working_h),
                 Constraint::Length(composer_h),
                 Constraint::Length(1),
             ])
@@ -387,17 +440,22 @@ impl AgentRepl {
         let menu_area = chunks[1];
         let approval_area = chunks[2];
         let questions_area = chunks[3];
-        let composer_area = chunks[4];
-        let status_area = chunks[5];
+        let working_area = chunks[4];
+        let composer_area = chunks[5];
+        let status_area = chunks[6];
 
         let spinner_frame = spinner::frame_for(self.start.elapsed());
         let text = self.active().render(&self.theme, &self.deco, spinner_frame);
+        // Pre-wrap with hanging indents so wrapped rows keep each block's gutter
+        // instead of spilling into the border column, then render with ratatui's
+        // own wrapping disabled (the lines already fit).
+        let text = crate::wrap::wrap_text(text, body_area.width);
 
         let body_style = Style::default()
             .bg(color(self.theme.palette.bg))
             .fg(color(self.theme.palette.text));
-        let paragraph = Paragraph::new(text).wrap(Wrap { trim: false }).style(body_style);
-        let content_height = paragraph.line_count(body_area.width) as u16;
+        let content_height = text.height() as u16;
+        let paragraph = Paragraph::new(text).style(body_style);
         let viewport_height = body_area.height;
         self.last_content_height = content_height;
         self.last_viewport_height = viewport_height;
@@ -420,14 +478,41 @@ impl AgentRepl {
         if let Some(qs) = self.questions.as_ref() {
             qs.render(&self.theme, frame, questions_area);
         }
-        composer_render::render(
-            &self.composer,
-            &self.theme,
-            frame,
-            composer_area,
-            spinner_frame,
-        );
+        self.draw_working_line(frame, working_area, spinner_frame);
+        let mascot_paint = self.mascot.as_deref().map(|m| MascotPaint {
+            mascot: m,
+            state: self.mascot_state,
+            elapsed: self.start.elapsed(),
+        });
+        composer_render::render(&self.composer, &self.theme, frame, composer_area, mascot_paint);
         self.draw_status_bar(frame, status_area);
+    }
+
+    /// The single working indicator: a spinner + "Working…" on a fixed line
+    /// directly above the composer, shown only while the agent runs (the area is
+    /// zero-height otherwise).
+    fn draw_working_line(&self, frame: &mut Frame, area: Rect, spinner_frame: char) {
+        if area.height == 0 || !self.working {
+            return;
+        }
+        let p = &self.theme.palette;
+        let line = Line::from(vec![
+            Span::raw("  ".to_string()),
+            Span::styled(
+                format!("{spinner_frame} "),
+                fg(p.warning).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Working\u{2026}".to_string(),
+                fg(p.text_dim).add_modifier(Modifier::ITALIC),
+            ),
+        ]);
+        // Match the transcript ("threads") background, not the raised composer
+        // panel — otherwise this line reads as part of the input box.
+        frame.render_widget(
+            Paragraph::new(line).style(Style::default().bg(color(p.bg))),
+            area,
+        );
     }
 
     fn draw_status_bar(&self, frame: &mut Frame, area: Rect) {

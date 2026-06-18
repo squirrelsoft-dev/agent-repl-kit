@@ -7,9 +7,9 @@
 use std::time::Duration;
 
 use agent_repl::{
-    AgentRepl, ApprovalChoice, ApprovalPrompt, DiffKind, DiffLine, EntryType, Event, ListEntry,
-    Question, QuestionForm, ReadLine, ReplHandle, SearchGroup, SearchHit, SearchResult, Theme,
-    TodoItem, TodoState, ToolCall, ToolKind,
+    AgentRepl, ApprovalChoice, ApprovalPrompt, BallMascot, DiffKind, DiffLine, EntryType, Event,
+    ListEntry, MascotState, Question, QuestionForm, ReadLine, ReplHandle, SearchGroup, SearchHit,
+    SearchResult, Theme, TodoItem, TodoState, ToolCall, ToolKind,
 };
 use anyhow::Result;
 use tokio::time::sleep;
@@ -27,6 +27,10 @@ async fn main() -> Result<()> {
         .with_model("agent-repl-demo")
         .with_cwd("~/agent-repl-kit")
         .with_branch("main")
+        // Attach the built-in reference mascot to the input's right strip. This
+        // call also reserves the strip width + raises the input's minimum height.
+        // (Implement the `Mascot` trait to drop in your own creature.)
+        .with_mascot(BallMascot)
         .with_file_completions(vec![
             "src/lib.rs".into(),
             "src/app.rs".into(),
@@ -183,6 +187,7 @@ async fn run_transcript(h: &ReplHandle) {
             ],
         },
     });
+    h.set_mascot_state(MascotState::Thinking);
     let h_search = h.start_tool(search_call.clone());
     sleep(Duration::from_millis(700)).await;
     h.finish_tool(h_search, search_call);
@@ -263,6 +268,7 @@ async fn run_transcript(h: &ReplHandle) {
             ],
         },
     );
+    h.set_mascot_state(MascotState::Coding);
     let h_edit1 = h.start_tool(settings_edit.clone());
     sleep(Duration::from_millis(900)).await;
     h.finish_tool(h_edit1, settings_edit);
@@ -300,10 +306,12 @@ async fn run_transcript(h: &ReplHandle) {
             exit: Some(2),
         },
     );
+    h.set_mascot_state(MascotState::Testing);
     let h_bash1 = h.start_tool(typecheck_fail.clone());
     sleep(Duration::from_millis(1500)).await;
     h.finish_tool(h_bash1, typecheck_fail);
 
+    h.set_mascot_state(MascotState::Error);
     h.emit(Event::error(
         "Typecheck failed \u{2014} 1 error (TS2345)",
         "`localStorage.getItem` returns `string | null`, but `useState<Theme>` expects \
@@ -316,6 +324,7 @@ async fn run_transcript(h: &ReplHandle) {
     ));
     sleep(Duration::from_millis(400)).await;
 
+    h.set_mascot_state(MascotState::Coding);
     // ---- edit: fallback ----
     let theme_edit2 = ToolCall::new(
         "src/theme/ThemeProvider.tsx",
@@ -356,10 +365,12 @@ async fn run_transcript(h: &ReplHandle) {
             exit: Some(0),
         },
     );
+    h.set_mascot_state(MascotState::Testing);
     let h_bash3 = h.start_tool(test_ok.clone());
     sleep(Duration::from_millis(1400)).await;
     h.finish_tool(h_bash3, test_ok);
 
+    h.set_mascot_state(MascotState::Success);
     // ---- todo (final) ----
     let todo_final = ToolCall::new(
         "plan",

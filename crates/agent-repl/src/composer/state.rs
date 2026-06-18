@@ -41,6 +41,12 @@ pub struct Composer {
     pub branch: Option<String>,
     /// Pool of file names available for `@file` completion.
     pub file_completions: Vec<String>,
+    /// Minimum rows the field reserves even when nearly empty (default 1).
+    /// Used to make room for a mascot drawn in the right strip.
+    min_visible_lines: usize,
+    /// Columns reserved on the right of the field (e.g. for a mascot). Text is
+    /// laid out in the remaining width, so it can't draw into this strip.
+    reserved_right: u16,
 }
 
 impl Default for Composer {
@@ -56,6 +62,8 @@ impl Default for Composer {
             cwd: String::new(),
             branch: None,
             file_completions: Vec::new(),
+            min_visible_lines: 1,
+            reserved_right: 0,
         }
     }
 }
@@ -116,7 +124,23 @@ impl Composer {
         self.lines.len()
     }
     pub fn visible_line_count(&self) -> usize {
-        self.lines.len().clamp(1, MAX_VISIBLE_LINES)
+        let floor = self.min_visible_lines.clamp(1, MAX_VISIBLE_LINES);
+        self.lines.len().clamp(floor, MAX_VISIBLE_LINES)
+    }
+
+    /// Minimum rows the field always shows (clamped to `[1, MAX_VISIBLE_LINES]`).
+    pub fn set_min_visible_lines(&mut self, n: usize) {
+        self.min_visible_lines = n;
+    }
+
+    /// Columns reserved on the right of the field for an accessory (e.g. a
+    /// mascot). The text area is the remaining width.
+    pub fn set_reserved_right(&mut self, cols: u16) {
+        self.reserved_right = cols;
+    }
+
+    pub fn reserved_right(&self) -> u16 {
+        self.reserved_right
     }
     pub fn scroll_top(&self) -> usize {
         self.scroll_top

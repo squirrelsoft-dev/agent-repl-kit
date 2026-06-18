@@ -592,6 +592,43 @@ fn render_stream_with(
 }
 
 // -----------------------------------------------------------------------------
+// hanging-indent wrap
+// -----------------------------------------------------------------------------
+
+#[test]
+fn pre_wrap_keeps_card_gutter_on_continuation_rows() {
+    use agent_repl::wrap::wrap_text;
+    let theme = Theme::slate().dark().card();
+    let mut stream = Stream::default();
+    stream.push(Event::assistant(
+        "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi \
+         omicron pi rho sigma tau upsilon phi chi psi omega",
+    ));
+    let text = stream.render(&theme, &Decorations::default(), '\u{280B}');
+    let before = text.lines.len();
+    let wrapped = wrap_text(text, 30);
+    assert!(wrapped.lines.len() > before, "expected wrapping to add rows");
+
+    let joined: Vec<String> = wrapped
+        .lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+        .collect();
+
+    // The card top keeps its corner; body continuations keep the "  │  " side.
+    assert!(joined.iter().any(|r| r.starts_with("  \u{256D}\u{2500} assistant")), "{joined:?}");
+    let side_rows = joined.iter().filter(|r| r.starts_with("  \u{2502}  ")).count();
+    assert!(side_rows >= 3, "expected several gutter-aligned rows: {joined:?}");
+    // No wrapped content row spills into the left padding / border column.
+    for r in &joined {
+        if r.trim().is_empty() {
+            continue;
+        }
+        assert!(r.starts_with("  "), "row lost left frame: {r:?}");
+    }
+}
+
+// -----------------------------------------------------------------------------
 // permissions box
 // -----------------------------------------------------------------------------
 
@@ -653,4 +690,41 @@ fn permissions_box_renders_across_every_vibe_and_mode() {
             }
         }
     }
+}
+
+// -----------------------------------------------------------------------------
+// running-tool dot pulse
+// -----------------------------------------------------------------------------
+
+#[test]
+fn running_tool_dot_pulses_then_settles() {
+    use agent_repl::blocks::tool;
+    use agent_repl::spinner::FRAMES;
+    use ratatui::text::Line;
+
+    fn dot_fg(lines: &[Line]) -> Option<ratatui::style::Color> {
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content == "\u{25CF} ")
+            .and_then(|s| s.style.fg)
+    }
+
+    let theme = Theme::slate().dark().inline();
+    let mut call = ToolCall::new(
+        "pnpm test",
+        ToolKind::Bash { cmd: "pnpm test".into(), output: String::new(), exit: None },
+    );
+    call.running = true;
+
+    // Two ends of the spinner cycle (phase 0 vs 0.5) → different dot colors.
+    let a = tool::render(&call, &theme, FRAMES[0], false, false);
+    let b = tool::render(&call, &theme, FRAMES[5], false, false);
+    assert_ne!(dot_fg(&a), dot_fg(&b), "running dot should pulse across spinner phases");
+
+    // Once finished, the dot is static regardless of the spinner phase.
+    call.running = false;
+    let c = tool::render(&call, &theme, FRAMES[0], false, false);
+    let d = tool::render(&call, &theme, FRAMES[5], false, false);
+    assert_eq!(dot_fg(&c), dot_fg(&d), "finished dot must not animate");
 }

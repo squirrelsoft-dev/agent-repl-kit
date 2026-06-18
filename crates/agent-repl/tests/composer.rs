@@ -424,3 +424,43 @@ fn esc_in_at_menu_strips_just_the_token() {
     assert_eq!(c.text(), "open ");
     assert!(!c.menu_open());
 }
+
+// -----------------------------------------------------------------------------
+// input sizing (min height + reserved right strip for a mascot)
+// -----------------------------------------------------------------------------
+
+#[test]
+fn min_visible_lines_floors_the_field_height() {
+    let mut c = Composer::default();
+    assert_eq!(c.visible_line_count(), 1, "default floor is one row");
+    c.set_min_visible_lines(4);
+    // An empty buffer still reserves the floor...
+    assert_eq!(c.visible_line_count(), 4);
+    // ...and the field still grows with content.
+    type_str(&mut c, "one");
+    c.handle_key(KeyCode::Enter, KeyModifiers::SHIFT);
+    type_str(&mut c, "two");
+    c.handle_key(KeyCode::Enter, KeyModifiers::SHIFT);
+    type_str(&mut c, "three");
+    c.handle_key(KeyCode::Enter, KeyModifiers::SHIFT);
+    type_str(&mut c, "four");
+    type_str(&mut c, "");
+    c.handle_key(KeyCode::Enter, KeyModifiers::SHIFT);
+    type_str(&mut c, "five");
+    assert_eq!(c.visible_line_count(), 5, "grows past the floor with content");
+}
+
+#[test]
+fn min_visible_lines_is_capped_at_max() {
+    let mut c = Composer::default();
+    c.set_min_visible_lines(1000);
+    assert_eq!(c.visible_line_count(), MAX_VISIBLE_LINES);
+}
+
+#[test]
+fn reserved_right_round_trips() {
+    let mut c = Composer::default();
+    assert_eq!(c.reserved_right(), 0);
+    c.set_reserved_right(9);
+    assert_eq!(c.reserved_right(), 9);
+}

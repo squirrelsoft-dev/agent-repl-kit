@@ -12,15 +12,18 @@ pub mod decorations;
 pub mod gallery;
 pub mod handle;
 pub mod markdown;
+pub mod mascot;
 pub mod question;
 pub mod spinner;
 pub mod stream;
 pub mod style;
+pub mod wrap;
 
 pub use agent_repl_core::*;
 pub use app::{AgentRepl, AppView};
 pub use composer::{Composer, ComposerAction};
 pub use decorations::Decorations;
 pub use handle::{ReplHandle, ToolHandle};
+pub use mascot::{BallMascot, Mascot, MascotState};
 pub use question::{QuestionAction, QuestionState};
 pub use stream::ToolId;

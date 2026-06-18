@@ -1,7 +1,7 @@
 //! Tool call wrapper. Builds a [`frame::Spec`] and dispatches to the
 //! shared framing helpers. Mirrors `<ToolCall>` in `docs/repl/blocks.jsx`.
 
-use agent_repl_core::{tool_meta, Palette, Theme, ToolCall, ToolKind};
+use agent_repl_core::{mix, tool_meta, Palette, Rgb, Theme, ToolCall, ToolKind};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -60,7 +60,7 @@ fn body_for(kind: &ToolKind, palette: &Palette) -> Vec<Line<'static>> {
 fn header_line(
     call: &ToolCall,
     label: &str,
-    hue: agent_repl_core::Rgb,
+    hue: Rgb,
     palette: &Palette,
     spinner_frame: char,
     focused: bool,
@@ -69,6 +69,10 @@ fn header_line(
         Style::default()
             .fg(color(palette.accent))
             .add_modifier(Modifier::BOLD)
+    } else if call.running {
+        // A running tool's dot "breathes" between a dim and full hue, in lockstep
+        // with the spinner clock, so an in-flight tool is easy to spot at a glance.
+        pulsing_dot_style(spinner_frame, hue, palette)
     } else {
         fg(hue)
     };
@@ -95,6 +99,15 @@ fn header_line(
         spans.extend(b);
     }
     Line::from(spans)
+}
+
+/// The dot color for a running tool: a cosine breathe between a dim hue (≈45%
+/// toward the background) and the full hue, phased off the spinner clock.
+fn pulsing_dot_style(spinner_frame: char, hue: Rgb, palette: &Palette) -> Style {
+    let pulse = crate::spinner::pulse_for(spinner_frame);
+    let dim = mix(palette.bg, hue, 0.45);
+    let col = mix(dim, hue, pulse);
+    fg(col).add_modifier(Modifier::BOLD)
 }
 
 fn badge_for(
