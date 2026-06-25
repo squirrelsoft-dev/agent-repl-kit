@@ -10,9 +10,13 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use crate::composer::state::{Composer, MenuKind};
+use crate::composer::state::{Composer, FieldLayout, MenuKind};
 use crate::mascot::{Mascot, MascotState};
 use crate::style::{color, fg};
+
+/// Columns the field spends on its leading gutter before typed text: 2 of pad
+/// plus the `❯ ` sigil (or, on continuation rows, an equal blank indent).
+const PREFIX_COLS: u16 = 4;
 
 /// What the composer needs to paint a mascot in its reserved right strip.
 #[derive(Debug)]
@@ -22,10 +26,33 @@ pub struct MascotPaint<'a> {
     pub elapsed: Duration,
 }
 
-/// Total rows the composer needs given the active theme. Grows with the
-/// buffer (capped at [`MAX_VISIBLE_LINES`]).
-pub fn required_height(composer: &Composer, theme: &Theme) -> u16 {
-    let visible = composer.visible_line_count() as u16;
+/// Inner width of the composer block for a given outer `area_width`: the full
+/// width for the borderless [`ToolStyle::Inline`] frame, two columns less for
+/// the fully-bordered styles.
+fn inner_width(area_width: u16, theme: &Theme) -> u16 {
+    match theme.tool_style {
+        ToolStyle::Inline => area_width,
+        _ => area_width.saturating_sub(2),
+    }
+}
+
+/// Columns available for typed text per row, given the field's inner width:
+/// the inner width minus the reserved right strip (e.g. for a mascot) minus the
+/// leading gutter. Floored at one so wrapping always makes progress.
+fn text_cols(inner_width: u16, reserved: u16) -> u16 {
+    let reserved = reserved.min(inner_width.saturating_sub(1));
+    inner_width
+        .saturating_sub(reserved)
+        .saturating_sub(PREFIX_COLS)
+        .max(1)
+}
+
+/// Total rows the composer needs for a given outer `area_width` and theme.
+/// Grows with the buffer — counting soft-wrapped rows, not just logical lines —
+/// capped at [`MAX_VISIBLE_LINES`].
+pub fn required_height(composer: &Composer, theme: &Theme, area_width: u16) -> u16 {
+    let cols = text_cols(inner_width(area_width, theme), composer.reserved_right());
+    let visible = composer.visible_line_count(cols) as u16;
     let breathing = breathing_rows(theme);
     1 /*top*/ + visible + breathing + 1 /*footer*/ + 1 /*bottom*/
 }
@@ -73,7 +100,12 @@ pub fn render(
         return;
     }
 
-    let visible = composer.visible_line_count() as u16;
+    // Wrap the buffer to the columns left after the reserved strip + gutter, so
+    // the field height (and scrolling) tracks soft-wrapped rows, not just the
+    // logical line count.
+    let cols = text_cols(inner.width, composer.reserved_right());
+    let layout = composer.layout(cols);
+    let visible = composer.clamp_visible(layout.rows.len()) as u16;
     let breathing = breathing_rows(theme).min(inner.height.saturating_sub(visible + 1));
     let field_area = Rect {
         x: inner.x,
@@ -116,7 +148,7 @@ pub fn render(
         }
     }
 
-    draw_field(composer, theme, frame, text_area);
+    draw_field(composer, theme, frame, text_area, &layout);
     draw_footer(composer, theme, frame, footer_area);
 }
 
@@ -188,7 +220,13 @@ pub fn render_menu(composer: &Composer, theme: &Theme, frame: &mut Frame, area: 
 // field
 // -----------------------------------------------------------------------------
 
-fn draw_field(composer: &Composer, theme: &Theme, frame: &mut Frame, area: Rect) {
+fn draw_field(
+    composer: &Composer,
+    theme: &Theme,
+    frame: &mut Frame,
+    area: Rect,
+    layout: &FieldLayout,
+) {
     let p = &theme.palette;
     // The working state lives on its own line above the composer (see
     // `AgentRepl::draw_working_line`); the field keeps its normal sigil and just
@@ -207,18 +245,16 @@ fn draw_field(composer: &Composer, theme: &Theme, frame: &mut Frame, area: Rect)
     let body_style = fg(p.text);
 
     let lines = composer.lines();
-    let scroll_top = composer.scroll_top();
     let visible = area.height as usize;
     let show_placeholder = composer.is_empty() && !composer.working;
+    // Scroll the wrapped rows to keep the cursor's row in view (the field only
+    // follows the caret; there is no independent scroll), so derive the window
+    // top from the cursor each frame.
+    let scroll_top = scroll_top_for(layout.cursor_row, layout.rows.len(), visible);
 
     let mut rows: Vec<Line<'static>> = Vec::with_capacity(visible);
     for vi in 0..visible {
-        let line_idx = scroll_top + vi;
-        if line_idx >= lines.len() {
-            // Pad blank rows so the field area stays its declared height.
-            rows.push(Line::raw(""));
-            continue;
-        }
+        let ri = scroll_top + vi;
         let is_first_row = vi == 0;
         let prefix = if is_first_row {
             vec![
@@ -229,24 +265,33 @@ fn draw_field(composer: &Composer, theme: &Theme, frame: &mut Frame, area: Rect)
             vec![Span::raw(continuation_str.clone())]
         };
         let mut spans = prefix;
-        let content = &lines[line_idx];
-        if is_first_row && show_placeholder {
-            spans.push(Span::styled(placeholder.to_string(), placeholder_style));
-        } else {
-            spans.extend(render_line_with_chips(content, body_style, chip_style));
+        if let Some(vrow) = layout.rows.get(ri) {
+            if is_first_row && show_placeholder {
+                spans.push(Span::styled(placeholder.to_string(), placeholder_style));
+            } else {
+                // Style the whole logical line into cells (so an `@token` split
+                // across a wrap keeps its chip styling on both rows), then take
+                // just this visual row's slice.
+                let cells = styled_cells(&lines[vrow.line], body_style, chip_style);
+                let slice = &cells[vrow.start.min(cells.len())..vrow.end.min(cells.len())];
+                spans.extend(cells_to_spans(slice));
+            }
         }
+        // Rows past the buffer stay blank so the field keeps its declared height.
         rows.push(Line::from(spans));
     }
 
     frame.render_widget(Paragraph::new(Text::from(rows)), area);
 
-    if !composer.working {
-        let cursor_vrow = composer.cursor_line().saturating_sub(scroll_top);
-        if cursor_vrow < area.height as usize {
-            // First visible row uses sigil prefix (4 cols), subsequent rows use
-            // continuation indent (also 4 cols) — same offset either way.
-            let prefix_cols: u16 = 4;
-            let cx = area.x + prefix_cols + composer.cursor_col() as u16;
+    // The field stays editable while the agent works (type-ahead), so show the
+    // cursor in both states — the "working" indicator is the spinner line above,
+    // not a hidden cursor.
+    {
+        let cursor_vrow = layout.cursor_row.saturating_sub(scroll_top);
+        if layout.cursor_row >= scroll_top && cursor_vrow < area.height as usize {
+            // Every row reserves the same 4-col gutter, so the cursor's screen
+            // column is the gutter plus its char offset within its visual row.
+            let cx = area.x + PREFIX_COLS + layout.cursor_col as u16;
             let cy = area.y + cursor_vrow as u16;
             if cx < area.x + area.width {
                 frame.set_cursor_position(Position { x: cx, y: cy });
@@ -255,40 +300,64 @@ fn draw_field(composer: &Composer, theme: &Theme, frame: &mut Frame, area: Rect)
     }
 }
 
-/// Split a line's text into plain spans + chip-styled spans for any
-/// `@token` that starts at word boundaries.
-fn render_line_with_chips(
-    line: &str,
-    body: Style,
-    chip: Style,
-) -> Vec<Span<'static>> {
+/// Topmost visual row to show so `cursor_row` stays inside a `height`-row
+/// window. Everything fits ⇒ top is 0; otherwise the cursor is pinned no lower
+/// than the last visible row and never scrolled past the end of the content.
+fn scroll_top_for(cursor_row: usize, total: usize, height: usize) -> usize {
+    if height == 0 || total <= height {
+        return 0;
+    }
+    let max_top = total - height;
+    cursor_row.saturating_sub(height - 1).min(max_top)
+}
+
+/// Style a logical line into per-char `(char, Style)` cells: `@token`s that
+/// begin at a word boundary get the chip style, everything else the body style.
+/// Working at cell granularity lets the renderer slice a token cleanly across a
+/// soft-wrap boundary.
+fn styled_cells(line: &str, body: Style, chip: Style) -> Vec<(char, Style)> {
     let chars: Vec<char> = line.chars().collect();
-    let mut out: Vec<Span<'static>> = Vec::new();
-    let mut buf = String::new();
+    let mut cells: Vec<(char, Style)> = Vec::with_capacity(chars.len());
     let mut i = 0;
     while i < chars.len() {
         let prev_is_boundary = i == 0 || chars[i - 1].is_whitespace();
         if chars[i] == '@' && prev_is_boundary {
-            if !buf.is_empty() {
-                out.push(Span::styled(std::mem::take(&mut buf), body));
-            }
-            let mut chip_text = String::from('@');
+            cells.push((chars[i], chip));
             let mut j = i + 1;
             while j < chars.len() && !chars[j].is_whitespace() {
-                chip_text.push(chars[j]);
+                cells.push((chars[j], chip));
                 j += 1;
             }
-            out.push(Span::styled(chip_text, chip));
             i = j;
         } else {
-            buf.push(chars[i]);
+            cells.push((chars[i], body));
             i += 1;
         }
     }
-    if !buf.is_empty() {
-        out.push(Span::styled(buf, body));
+    cells
+}
+
+/// Coalesce a run of styled cells into the fewest spans.
+fn cells_to_spans(cells: &[(char, Style)]) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut cur: Option<Style> = None;
+    for &(c, style) in cells {
+        match cur {
+            Some(s) if s == style => buf.push(c),
+            _ => {
+                if let Some(s) = cur {
+                    spans.push(Span::styled(std::mem::take(&mut buf), s));
+                }
+                buf.push(c);
+                cur = Some(style);
+            }
+        }
     }
-    out
+    if let Some(s) = cur {
+        spans.push(Span::styled(buf, s));
+    }
+    spans
 }
 
 // -----------------------------------------------------------------------------

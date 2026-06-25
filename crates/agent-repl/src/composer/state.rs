@@ -26,8 +26,6 @@ pub struct Composer {
     cursor_line: usize,
     /// Cursor column as a *char* index into `lines[cursor_line]`.
     cursor_col: usize,
-    /// Top of the visible window inside the field.
-    scroll_top: usize,
     /// Currently selected row in the active menu (slash or `@file`).
     /// Always clamped to the filtered item list.
     menu_selected: usize,
@@ -55,7 +53,6 @@ impl Default for Composer {
             lines: vec![String::new()],
             cursor_line: 0,
             cursor_col: 0,
-            scroll_top: 0,
             menu_selected: 0,
             working: false,
             model: "agent".into(),
@@ -72,6 +69,29 @@ impl Default for Composer {
 pub enum MenuKind {
     Slash,
     At,
+}
+
+/// One visual (soft-wrapped) row of the field: a half-open char range
+/// `[start, end)` into logical line `line`. A logical line that fits produces a
+/// single row; a longer one is broken into several rows of equal width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VisualRow {
+    pub line: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// The buffer laid out into visual rows wrapped to a given content width, plus
+/// where the cursor falls in that visual space. Produced by [`Composer::layout`]
+/// and consumed by the renderer for sizing, scrolling, and cursor placement.
+#[derive(Debug, Clone)]
+pub struct FieldLayout {
+    /// Visual rows, top to bottom. Always at least one.
+    pub rows: Vec<VisualRow>,
+    /// Index into `rows` holding the cursor.
+    pub cursor_row: usize,
+    /// Cursor's char offset within its visual row.
+    pub cursor_col: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -123,9 +143,60 @@ impl Composer {
     pub fn line_count(&self) -> usize {
         self.lines.len()
     }
-    pub fn visible_line_count(&self) -> usize {
+
+    /// Lay the buffer out into visual rows wrapped to `width` content columns
+    /// (the space left for text after the field's prefix gutter). Wrapping is
+    /// by char count, so every character — cursor included — maps to exactly one
+    /// cell. A line whose length is an exact multiple of `width` gets a trailing
+    /// empty row *only* when the cursor rests at that boundary, giving the caret
+    /// (and the next keystroke) a home on the fresh row.
+    pub fn layout(&self, width: u16) -> FieldLayout {
+        let w = (width as usize).max(1);
+        let mut rows: Vec<VisualRow> = Vec::with_capacity(self.lines.len());
+        let mut cursor_row = 0;
+        let mut cursor_col = 0;
+        for (li, line) in self.lines.iter().enumerate() {
+            let n = line.chars().count();
+            let row_start = rows.len();
+            if n == 0 {
+                rows.push(VisualRow { line: li, start: 0, end: 0 });
+            } else {
+                let mut s = 0;
+                while s < n {
+                    let e = (s + w).min(n);
+                    rows.push(VisualRow { line: li, start: s, end: e });
+                    s = e;
+                }
+            }
+            if li == self.cursor_line {
+                let col = self.cursor_col.min(n);
+                let within = col / w;
+                let content_rows = rows.len() - row_start;
+                if within >= content_rows {
+                    // Cursor sits one past the last full row (`col == n` and `n`
+                    // is a positive multiple of `w`): start a fresh trailing row.
+                    rows.push(VisualRow { line: li, start: n, end: n });
+                    cursor_row = rows.len() - 1;
+                    cursor_col = 0;
+                } else {
+                    cursor_row = row_start + within;
+                    cursor_col = col % w;
+                }
+            }
+        }
+        FieldLayout { rows, cursor_row, cursor_col }
+    }
+
+    /// Clamp a visual-row count to the field's `[min_visible_lines, MAX]` window.
+    pub fn clamp_visible(&self, total_rows: usize) -> usize {
         let floor = self.min_visible_lines.clamp(1, MAX_VISIBLE_LINES);
-        self.lines.len().clamp(floor, MAX_VISIBLE_LINES)
+        total_rows.clamp(floor, MAX_VISIBLE_LINES)
+    }
+
+    /// Rows the field shows for content wrapped to `width` content columns:
+    /// the wrapped row count, floored by the minimum and capped at the max.
+    pub fn visible_line_count(&self, width: u16) -> usize {
+        self.clamp_visible(self.layout(width).rows.len())
     }
 
     /// Minimum rows the field always shows (clamped to `[1, MAX_VISIBLE_LINES]`).
@@ -141,9 +212,6 @@ impl Composer {
 
     pub fn reserved_right(&self) -> u16 {
         self.reserved_right
-    }
-    pub fn scroll_top(&self) -> usize {
-        self.scroll_top
     }
     pub fn cursor_line(&self) -> usize {
         self.cursor_line
@@ -162,7 +230,6 @@ impl Composer {
         self.lines = vec![String::new()];
         self.cursor_line = 0;
         self.cursor_col = 0;
-        self.scroll_top = 0;
         self.menu_selected = 0;
     }
 
@@ -309,12 +376,12 @@ impl Composer {
             return ComposerAction::PassThrough;
         }
 
-        if self.working {
-            if code == KeyCode::Esc {
-                return ComposerAction::PassThrough;
-            }
-            return ComposerAction::Consumed;
-        }
+        // While the agent is working the field stays fully usable: the user can
+        // edit a draft (type-ahead), and keys the composer doesn't claim
+        // (scroll, theme, focus, F-keys) still PassThrough to the app so the TUI
+        // stays live mid-run. The ONLY thing `working` defers is SUBMIT — see the
+        // `KeyCode::Enter` arm below, which keeps the draft instead of starting a
+        // new turn until the agent goes idle.
 
         // Menu navigation takes precedence when a menu is open.
         if self.menu_open() {
@@ -352,6 +419,12 @@ impl Composer {
         match code {
             KeyCode::Enter => {
                 if self.is_empty() {
+                    return ComposerAction::Consumed;
+                }
+                if self.working {
+                    // The agent is busy: keep the draft rather than submit a new
+                    // turn mid-run. It sends once the user hits Enter after work
+                    // ends (the field is editable throughout).
                     return ComposerAction::Consumed;
                 }
                 let text = self.text();
@@ -491,7 +564,6 @@ impl Composer {
             self.cursor_line -= 1;
             self.cursor_col = self.lines[self.cursor_line].chars().count();
         }
-        self.update_scroll();
     }
 
     fn cursor_right(&mut self) {
@@ -502,7 +574,6 @@ impl Composer {
             self.cursor_line += 1;
             self.cursor_col = 0;
         }
-        self.update_scroll();
     }
 
     fn cursor_up(&mut self) {
@@ -512,7 +583,6 @@ impl Composer {
         self.cursor_line -= 1;
         let len = self.lines[self.cursor_line].chars().count();
         self.cursor_col = self.cursor_col.min(len);
-        self.update_scroll();
     }
 
     fn cursor_down(&mut self) {
@@ -522,21 +592,10 @@ impl Composer {
         self.cursor_line += 1;
         let len = self.lines[self.cursor_line].chars().count();
         self.cursor_col = self.cursor_col.min(len);
-        self.update_scroll();
     }
 
     fn after_edit(&mut self) {
-        self.update_scroll();
         self.clamp_menu_selected();
-    }
-
-    fn update_scroll(&mut self) {
-        if self.cursor_line < self.scroll_top {
-            self.scroll_top = self.cursor_line;
-        }
-        if self.cursor_line >= self.scroll_top + MAX_VISIBLE_LINES {
-            self.scroll_top = self.cursor_line + 1 - MAX_VISIBLE_LINES;
-        }
     }
 }
 

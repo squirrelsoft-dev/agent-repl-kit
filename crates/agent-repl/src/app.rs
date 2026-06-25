@@ -412,7 +412,7 @@ impl AgentRepl {
 
     fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
-        let composer_h = composer_render::required_height(&self.composer, &self.theme);
+        let composer_h = composer_render::required_height(&self.composer, &self.theme, area.width);
         let menu_h = composer_render::menu_height(&self.composer, &self.theme);
         // The permissions box and question form both float directly above the
         // composer while active; each claims zero rows otherwise.

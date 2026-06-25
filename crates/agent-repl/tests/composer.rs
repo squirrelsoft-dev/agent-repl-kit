@@ -142,14 +142,29 @@ fn esc_on_empty_buffer_passes_through() {
 }
 
 #[test]
-fn working_state_swallows_keys_except_esc() {
+fn working_state_allows_editing_and_navigation_but_defers_submit() {
     let mut c = Composer::new();
     c.set_working(true);
-    let (k, m) = key(KeyCode::Char('x'));
-    assert_eq!(c.handle_key(k, m), ComposerAction::Consumed);
-    assert!(c.is_empty());
-    let (k, m) = key(KeyCode::Esc);
-    assert_eq!(c.handle_key(k, m), ComposerAction::PassThrough);
+
+    // Type-ahead: the draft stays editable while the agent is busy.
+    assert_eq!(c.handle_key(KeyCode::Char('h'), KeyModifiers::NONE), ComposerAction::Consumed);
+    assert_eq!(c.handle_key(KeyCode::Char('i'), KeyModifiers::NONE), ComposerAction::Consumed);
+    assert!(!c.is_empty(), "draft accepts input while working");
+
+    // App-level keys still pass through so scroll / theme stay live mid-run.
+    // `Up` on the first line scrolls the transcript rather than the cursor.
+    assert_eq!(c.handle_key(KeyCode::Up, KeyModifiers::NONE), ComposerAction::PassThrough);
+
+    // A plain Enter does NOT submit a new turn while working — it keeps the draft.
+    assert_eq!(c.handle_key(KeyCode::Enter, KeyModifiers::NONE), ComposerAction::Consumed);
+    assert!(!c.is_empty(), "submit is deferred; the draft is preserved");
+
+    // Once the agent goes idle, the preserved draft submits normally.
+    c.set_working(false);
+    let ComposerAction::Submit(text) = c.handle_key(KeyCode::Enter, KeyModifiers::NONE) else {
+        panic!("expected Submit once idle");
+    };
+    assert_eq!(text, "hi");
 }
 
 #[test]
@@ -269,7 +284,7 @@ fn backspace_at_line_start_joins_with_previous() {
 }
 
 #[test]
-fn long_buffer_scrolls_field_window() {
+fn long_buffer_caps_visible_rows_at_max() {
     let mut c = Composer::new();
     for i in 0..(MAX_VISIBLE_LINES + 5) {
         type_str(&mut c, &format!("L{i}"));
@@ -277,12 +292,68 @@ fn long_buffer_scrolls_field_window() {
     }
     // Last line is empty (after final shift+enter); cursor on it.
     assert!(c.line_count() > MAX_VISIBLE_LINES);
-    // Cursor must be visible in the scroll window.
-    let st = c.scroll_top();
-    assert!(c.cursor_line() >= st);
-    assert!(c.cursor_line() < st + MAX_VISIBLE_LINES);
-    // visible_line_count is capped.
-    assert_eq!(c.visible_line_count(), MAX_VISIBLE_LINES);
+    // At a wide width nothing wraps: one visual row per logical line.
+    let layout = c.layout(80);
+    assert_eq!(layout.rows.len(), c.line_count());
+    // The visible window is capped, and the cursor lands on the final row.
+    assert_eq!(c.visible_line_count(80), MAX_VISIBLE_LINES);
+    assert_eq!(layout.cursor_row, c.line_count() - 1);
+}
+
+// -----------------------------------------------------------------------------
+// soft-wrap
+// -----------------------------------------------------------------------------
+
+#[test]
+fn long_line_wraps_into_multiple_visual_rows() {
+    let mut c = Composer::new();
+    type_str(&mut c, &"x".repeat(25));
+    // 25 chars at 10 content columns → rows [0,10) [10,20) [20,25).
+    let layout = c.layout(10);
+    assert_eq!(layout.rows.len(), 3);
+    assert_eq!((layout.rows[0].start, layout.rows[0].end), (0, 10));
+    assert_eq!((layout.rows[1].start, layout.rows[1].end), (10, 20));
+    assert_eq!((layout.rows[2].start, layout.rows[2].end), (20, 25));
+    assert!(layout.rows.iter().all(|r| r.line == 0));
+    // Cursor at the end (col 25) sits on the last row, 5 cols in.
+    assert_eq!(layout.cursor_row, 2);
+    assert_eq!(layout.cursor_col, 5);
+}
+
+#[test]
+fn cursor_at_exact_wrap_boundary_gets_a_trailing_row() {
+    let mut c = Composer::new();
+    type_str(&mut c, &"x".repeat(20)); // exactly 2 * 10
+    let layout = c.layout(10);
+    // Two full content rows plus a fresh trailing row for the caret.
+    assert_eq!(layout.rows.len(), 3);
+    assert_eq!((layout.rows[2].start, layout.rows[2].end), (20, 20));
+    assert_eq!(layout.cursor_row, 2);
+    assert_eq!(layout.cursor_col, 0);
+}
+
+#[test]
+fn visible_line_count_counts_wrapped_rows() {
+    let mut c = Composer::new();
+    type_str(&mut c, &"x".repeat(25));
+    // Narrow: 25 chars / 10 cols → 3 visual rows.
+    assert_eq!(c.visible_line_count(10), 3);
+    // Wide: fits on one row.
+    assert_eq!(c.visible_line_count(80), 1);
+}
+
+#[test]
+fn wrap_maps_cursor_within_a_long_line() {
+    let mut c = Composer::new();
+    type_str(&mut c, &"x".repeat(25));
+    // Walk the cursor back to char 12 (second wrapped row, 2 cols in).
+    for _ in 0..13 {
+        c.handle_key(KeyCode::Left, KeyModifiers::NONE);
+    }
+    assert_eq!(c.cursor_col(), 12);
+    let layout = c.layout(10);
+    assert_eq!(layout.cursor_row, 1);
+    assert_eq!(layout.cursor_col, 2);
 }
 
 // -----------------------------------------------------------------------------
@@ -432,10 +503,10 @@ fn esc_in_at_menu_strips_just_the_token() {
 #[test]
 fn min_visible_lines_floors_the_field_height() {
     let mut c = Composer::default();
-    assert_eq!(c.visible_line_count(), 1, "default floor is one row");
+    assert_eq!(c.visible_line_count(80), 1, "default floor is one row");
     c.set_min_visible_lines(4);
     // An empty buffer still reserves the floor...
-    assert_eq!(c.visible_line_count(), 4);
+    assert_eq!(c.visible_line_count(80), 4);
     // ...and the field still grows with content.
     type_str(&mut c, "one");
     c.handle_key(KeyCode::Enter, KeyModifiers::SHIFT);
@@ -447,14 +518,14 @@ fn min_visible_lines_floors_the_field_height() {
     type_str(&mut c, "");
     c.handle_key(KeyCode::Enter, KeyModifiers::SHIFT);
     type_str(&mut c, "five");
-    assert_eq!(c.visible_line_count(), 5, "grows past the floor with content");
+    assert_eq!(c.visible_line_count(80), 5, "grows past the floor with content");
 }
 
 #[test]
 fn min_visible_lines_is_capped_at_max() {
     let mut c = Composer::default();
     c.set_min_visible_lines(1000);
-    assert_eq!(c.visible_line_count(), MAX_VISIBLE_LINES);
+    assert_eq!(c.visible_line_count(80), MAX_VISIBLE_LINES);
 }
 
 #[test]

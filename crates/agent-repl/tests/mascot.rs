@@ -19,7 +19,7 @@ const ARC: char = '\u{256D}';
 
 fn render_rows(composer: &Composer, mascot_state: MascotState) -> Vec<String> {
     let theme = Theme::slate().dark().card();
-    let height = crender::required_height(composer, &theme);
+    let height = crender::required_height(composer, &theme, W);
     let mascot = BallMascot;
     let backend = TestBackend::new(W, height);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -70,8 +70,8 @@ fn mascot_renders_in_the_right_strip() {
 }
 
 #[test]
-fn typed_text_is_clipped_before_the_mascot() {
-    // A long line that would overrun the whole width if not reserved.
+fn typed_text_wraps_and_never_overdraws_the_mascot() {
+    // A long line that would overrun the whole width if it didn't wrap.
     let long = "x".repeat(200);
     let rows = render_rows(&typed(&long), MascotState::Idle);
 
@@ -79,17 +79,18 @@ fn typed_text_is_clipped_before_the_mascot() {
     let arc_row = rows.iter().find(|r| r.contains(ARC)).unwrap();
     let mascot_col = arc_row.chars().position(|c| c == ARC).unwrap();
 
-    // The run of typed 'x's must end before the mascot begins (with the gap).
-    let text_row = rows.iter().find(|r| r.contains('\u{276F}')).unwrap(); // ❯ prompt row
-    let last_x = text_row
-        .chars()
-        .enumerate()
-        .filter(|&(_, c)| c == 'x')
-        .map(|(i, _)| i)
-        .last()
-        .expect("typed text visible");
-    assert!(
-        last_x < mascot_col,
-        "text (last x @ {last_x}) ran into the mascot (@ {mascot_col})"
-    );
+    // The text soft-wraps instead of being clipped away: more than one row
+    // carries typed 'x's.
+    let text_rows = rows.iter().filter(|r| r.contains('x')).count();
+    assert!(text_rows > 1, "expected the long line to wrap across rows, got {text_rows}");
+
+    // And on every row the run of 'x's ends before the mascot's strip — text
+    // is confined to the left and never overdraws the creature.
+    for row in rows.iter().filter(|r| r.contains('x')) {
+        let last_x = row.chars().enumerate().filter(|&(_, c)| c == 'x').map(|(i, _)| i).last().unwrap();
+        assert!(
+            last_x < mascot_col,
+            "wrapped text (last x @ {last_x}) ran into the mascot (@ {mascot_col})"
+        );
+    }
 }

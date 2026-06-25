@@ -6,5 +6,6 @@ pub mod render;
 pub mod state;
 
 pub use state::{
-    Composer, ComposerAction, MenuItem, MenuKind, MAX_VISIBLE_LINES, SLASH_COMMANDS,
+    Composer, ComposerAction, FieldLayout, MenuItem, MenuKind, VisualRow, MAX_VISIBLE_LINES,
+    SLASH_COMMANDS,
 };
