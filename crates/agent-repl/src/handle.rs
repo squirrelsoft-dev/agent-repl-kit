@@ -3,7 +3,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use agent_repl_core::{ApprovalChoice, ApprovalPrompt, Event, FormAnswers, QuestionForm, ToolCall};
+use agent_repl_core::{
+    ApprovalChoice, ApprovalPrompt, Event, FormAnswers, QuestionForm, TodoItem, ToolCall,
+};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::mascot::MascotState;
@@ -21,6 +23,8 @@ pub(crate) enum Msg {
     SetQuestions(Option<QuestionForm>),
     // Set the mascot's expression.
     SetMascotState(MascotState),
+    // Replace the sticky task-list panel (empty ⇒ hide it).
+    SetTasks(Vec<TodoItem>),
 }
 
 /// Opaque handle to a tool block already in the stream. Used to update it
@@ -95,6 +99,18 @@ impl ReplHandle {
     /// mascot is attached.
     pub fn set_mascot_state(&self, state: MascotState) {
         let _ = self.tx.send(Msg::SetMascotState(state));
+    }
+
+    /// Replace the sticky task-list panel that floats above the working line.
+    /// Each [`TodoItem`] carries its own `Done` / `Active` / `Pending` state.
+    /// Pass an empty list (or call [`clear_tasks`](Self::clear_tasks)) to hide it.
+    pub fn set_tasks(&self, tasks: Vec<TodoItem>) {
+        let _ = self.tx.send(Msg::SetTasks(tasks));
+    }
+
+    /// Hide the task-list panel (equivalent to `set_tasks(vec![])`).
+    pub fn clear_tasks(&self) {
+        let _ = self.tx.send(Msg::SetTasks(Vec::new()));
     }
 
     /// Await the next line of user input. Returns `None` if the REPL has

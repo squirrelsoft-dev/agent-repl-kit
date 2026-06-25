@@ -17,6 +17,7 @@ pub mod question;
 pub mod spinner;
 pub mod stream;
 pub mod style;
+pub mod tasks;
 pub mod wrap;
 
 pub use agent_repl_core::*;

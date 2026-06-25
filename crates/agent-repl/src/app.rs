@@ -5,7 +5,7 @@ use std::io::{self, Stdout};
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
-use agent_repl_core::{ApprovalChoice, ApprovalPrompt, FormAnswers, Theme};
+use agent_repl_core::{ApprovalChoice, ApprovalPrompt, FormAnswers, Theme, TodoItem};
 use anyhow::Result;
 use crossterm::event::{self, Event as CtEvent, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -31,6 +31,7 @@ use crate::question::{QuestionAction, QuestionState};
 use crate::spinner;
 use crate::stream::Stream;
 use crate::style::{color, fg};
+use crate::tasks;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -71,6 +72,8 @@ pub struct AgentRepl {
     // Optional mascot drawn in the composer's right strip + its expression.
     mascot: Option<Box<dyn Mascot>>,
     mascot_state: MascotState,
+    // Sticky task-list panel above the working line (empty ⇒ hidden).
+    tasks: Vec<TodoItem>,
 }
 
 impl std::fmt::Debug for AgentRepl {
@@ -121,6 +124,7 @@ impl AgentRepl {
             answers_tx,
             mascot: None,
             mascot_state: MascotState::Idle,
+            tasks: Vec::new(),
         };
         (app, handle)
     }
@@ -254,6 +258,7 @@ impl AgentRepl {
                 self.questions = form.map(QuestionState::new);
             }
             Msg::SetMascotState(state) => self.mascot_state = state,
+            Msg::SetTasks(tasks) => self.tasks = tasks,
         }
     }
 
@@ -421,6 +426,9 @@ impl AgentRepl {
             .as_ref()
             .map(QuestionState::required_height)
             .unwrap_or(0);
+        // The sticky task-list panel floats directly above the working line
+        // while there are tasks (zero rows otherwise).
+        let tasks_h = tasks::required_height(&self.tasks);
         // A single "working" line sits directly above the composer while the
         // agent runs (it replaces the old in-field + in-footer spinners).
         let working_h: u16 = if self.working { 1 } else { 0 };
@@ -431,6 +439,7 @@ impl AgentRepl {
                 Constraint::Length(menu_h),
                 Constraint::Length(approval_h),
                 Constraint::Length(questions_h),
+                Constraint::Length(tasks_h),
                 Constraint::Length(working_h),
                 Constraint::Length(composer_h),
                 Constraint::Length(1),
@@ -440,9 +449,10 @@ impl AgentRepl {
         let menu_area = chunks[1];
         let approval_area = chunks[2];
         let questions_area = chunks[3];
-        let working_area = chunks[4];
-        let composer_area = chunks[5];
-        let status_area = chunks[6];
+        let tasks_area = chunks[4];
+        let working_area = chunks[5];
+        let composer_area = chunks[6];
+        let status_area = chunks[7];
 
         let spinner_frame = spinner::frame_for(self.start.elapsed());
         let text = self.active().render(&self.theme, &self.deco, spinner_frame);
@@ -478,6 +488,7 @@ impl AgentRepl {
         if let Some(qs) = self.questions.as_ref() {
             qs.render(&self.theme, frame, questions_area);
         }
+        tasks::render(&self.tasks, &self.theme, frame, tasks_area);
         self.draw_working_line(frame, working_area, spinner_frame);
         let mascot_paint = self.mascot.as_deref().map(|m| MascotPaint {
             mascot: m,
