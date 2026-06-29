@@ -25,6 +25,14 @@ pub(crate) enum Msg {
     SetMascotState(MascotState),
     // Replace the sticky task-list panel (empty ⇒ hide it).
     SetTasks(Vec<TodoItem>),
+    // Update the footer model pill.
+    SetModel(String),
+    // Update the footer branch pill (`None` ⇒ hide it).
+    SetBranch(Option<String>),
+    // Update the footer token-usage chip (`None` ⇒ hide it).
+    SetTokens(Option<String>),
+    // Update the working-line activity detail (`None` ⇒ just the timer).
+    SetActivity(Option<String>),
 }
 
 /// Opaque handle to a tool block already in the stream. Used to update it
@@ -111,6 +119,40 @@ impl ReplHandle {
     /// Hide the task-list panel (equivalent to `set_tasks(vec![])`).
     pub fn clear_tasks(&self) {
         let _ = self.tx.send(Msg::SetTasks(Vec::new()));
+    }
+
+    /// Update the footer model pill at runtime (the `◇ …` chip). The builder-time
+    /// [`AgentRepl::with_model`](crate::AgentRepl::with_model) sets the initial
+    /// value; this lets the driver change it mid-session (e.g. on a model switch).
+    pub fn set_model(&self, model: impl Into<String>) {
+        let _ = self.tx.send(Msg::SetModel(model.into()));
+    }
+
+    /// Update the footer branch pill at runtime (the `⎇ …` chip); `None` hides it.
+    /// The builder-time [`AgentRepl::with_branch`](crate::AgentRepl::with_branch)
+    /// sets the initial value. Drivers that surface the active mode here can call
+    /// this on a mode switch so the pill always reflects the live state.
+    pub fn set_branch(&self, branch: Option<String>) {
+        let _ = self.tx.send(Msg::SetBranch(branch));
+    }
+
+    /// Update the footer token-usage chip at runtime (the `⛁ …` chip); `None`
+    /// hides it. The string is pre-formatted by the host app (e.g. a compact
+    /// `"120k/210k"` context/total figure) and rendered verbatim after the
+    /// branch pill. There is no builder-time setter — the chip stays hidden
+    /// until the driver reports usage.
+    pub fn set_tokens(&self, tokens: Option<String>) {
+        let _ = self.tx.send(Msg::SetTokens(tokens));
+    }
+
+    /// Set the working-line activity detail — the text shown after the elapsed
+    /// timer while the agent runs (e.g. `"↓ 1.8k tokens"`). The kit owns the
+    /// live `(Ns · …)` framing and the ticking timer; the driver supplies only
+    /// this inner detail and updates it as work progresses. `None` shows just the
+    /// timer. Auto-cleared when the agent stops working ([`Self::set_working`]
+    /// `false` / [`Self::recv_input`]), so a driver never needs to reset it.
+    pub fn set_activity(&self, detail: Option<String>) {
+        let _ = self.tx.send(Msg::SetActivity(detail));
     }
 
     /// Await the next line of user input. Returns `None` if the REPL has

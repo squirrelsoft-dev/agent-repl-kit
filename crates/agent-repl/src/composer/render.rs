@@ -386,6 +386,10 @@ fn draw_footer(composer: &Composer, theme: &Theme, frame: &mut Frame, area: Rect
         left_spans.push(sep.clone());
         left_spans.push(Span::styled(format!("\u{2387} {branch}"), fg(p.text_dim)));
     }
+    if let Some(tokens) = &composer.tokens {
+        left_spans.push(sep.clone());
+        left_spans.push(Span::styled(format!("\u{26C1} {tokens}"), fg(p.text_dim)));
+    }
 
     let right_text = if composer.working {
         "esc interrupt".to_string()

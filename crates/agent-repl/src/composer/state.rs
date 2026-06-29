@@ -7,8 +7,49 @@ use crossterm::event::{KeyCode, KeyModifiers};
 /// Adding lines beyond this scrolls the field, not the composer chrome.
 pub const MAX_VISIBLE_LINES: usize = 10;
 
-/// Slash commands offered by the popup menu. Sourced from
-/// `docs/repl/input.jsx` (the `SLASH` constant).
+/// Most `@file` matches shown at once (the pool may be the whole workspace).
+const AT_MENU_MAX: usize = 12;
+
+/// Fuzzy subsequence score of `query` (already lowercased) against `candidate`.
+/// `None` if `candidate` lacks the query chars in order; higher is better.
+/// Contiguous runs and word-boundary starts score up; skipped chars and length
+/// score down. An empty query matches everything at score 0.
+fn fuzzy_score(candidate: &str, query: &str) -> Option<i32> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let cand: Vec<char> = candidate.to_lowercase().chars().collect();
+    let mut score = 0i32;
+    let mut ci = 0usize;
+    let mut prev_match: Option<usize> = None;
+    for qc in query.chars() {
+        let start = ci;
+        while ci < cand.len() && cand[ci] != qc {
+            ci += 1;
+        }
+        if ci == cand.len() {
+            return None;
+        }
+        if prev_match == Some(ci.wrapping_sub(1)) {
+            score += 8; // contiguous with the previous match
+        }
+        if ci == 0 || matches!(cand[ci - 1], '/' | '_' | '-' | '.' | ' ') {
+            score += 6; // match begins a path/word segment
+        }
+        score -= (ci - start) as i32; // chars skipped to reach this match
+        prev_match = Some(ci);
+        ci += 1;
+    }
+    score -= cand.len() as i32 / 16; // mild preference for tighter candidates
+    Some(score)
+}
+
+/// The BUILT-IN demo slash commands offered by the popup menu when a host app
+/// does not supply its own. Sourced from `docs/repl/input.jsx` (the `SLASH`
+/// constant). A real app overrides this via
+/// [`AgentRepl::with_slash_commands`](crate::AgentRepl::with_slash_commands) /
+/// [`Composer::set_slash_commands`] so the menu lists ITS commands — these are
+/// just a placeholder, NOT a contract the host is required to implement.
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/clear", "Clear the conversation"),
     ("/compact", "Summarize & free up context"),
@@ -17,6 +58,11 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/undo", "Revert the last edit"),
     ("/run", "Run a shell command"),
 ];
+
+/// The default slash-command catalog (owned), used when a host app installs none.
+fn default_slash_commands() -> Vec<(String, String)> {
+    SLASH_COMMANDS.iter().map(|(c, d)| (c.to_string(), d.to_string())).collect()
+}
 
 #[derive(Debug, Clone)]
 pub struct Composer {
@@ -37,8 +83,17 @@ pub struct Composer {
     pub cwd: String,
     /// Footer context: git branch if known.
     pub branch: Option<String>,
+    /// Footer context: token-usage figure shown as a `⛁ …` chip (e.g.
+    /// `"120k/210k"`). Pre-formatted by the host app; `None` hides the chip.
+    pub tokens: Option<String>,
     /// Pool of file names available for `@file` completion.
     pub file_completions: Vec<String>,
+    /// Slash-command catalog shown by the `/` menu, as `(command, description)`
+    /// pairs (each command includes its leading `/`). Defaults to the built-in
+    /// [`SLASH_COMMANDS`]; a host app overrides it via
+    /// [`set_slash_commands`](Self::set_slash_commands) to advertise its OWN
+    /// commands so the menu matches what the app actually handles.
+    pub slash_commands: Vec<(String, String)>,
     /// Minimum rows the field reserves even when nearly empty (default 1).
     /// Used to make room for a mascot drawn in the right strip.
     min_visible_lines: usize,
@@ -58,7 +113,9 @@ impl Default for Composer {
             model: "agent".into(),
             cwd: String::new(),
             branch: None,
+            tokens: None,
             file_completions: Vec::new(),
+            slash_commands: default_slash_commands(),
             min_visible_lines: 1,
             reserved_right: 0,
         }
@@ -127,11 +184,21 @@ impl Composer {
     pub fn set_branch(&mut self, b: Option<String>) {
         self.branch = b;
     }
+    pub fn set_tokens(&mut self, t: Option<String>) {
+        self.tokens = t;
+    }
     pub fn set_working(&mut self, w: bool) {
         self.working = w;
     }
     pub fn set_file_completions(&mut self, files: Vec<String>) {
         self.file_completions = files;
+        self.clamp_menu_selected();
+    }
+
+    /// Replace the slash-command catalog shown by the `/` menu. Each entry is
+    /// `(command, description)` with the command's leading `/` included.
+    pub fn set_slash_commands(&mut self, commands: Vec<(String, String)>) {
+        self.slash_commands = commands;
         self.clamp_menu_selected();
     }
 
@@ -276,12 +343,14 @@ impl Composer {
         match self.menu_kind() {
             Some(MenuKind::Slash) => {
                 let q = self.lines[0].strip_prefix('/').unwrap_or("").to_lowercase();
-                SLASH_COMMANDS
+                self.slash_commands
                     .iter()
-                    .filter(|(cmd, _)| cmd[1..].to_lowercase().starts_with(&q))
+                    .filter(|(cmd, _)| {
+                        cmd.strip_prefix('/').unwrap_or(cmd).to_lowercase().starts_with(&q)
+                    })
                     .map(|(cmd, desc)| MenuItem {
-                        value: (*cmd).to_string(),
-                        description: (*desc).to_string(),
+                        value: cmd.clone(),
+                        description: desc.clone(),
                     })
                     .collect()
             }
@@ -290,10 +359,22 @@ impl Composer {
                     .find_at_token()
                     .map(|(_, q)| q.to_lowercase())
                     .unwrap_or_default();
-                self.file_completions
+                // Fuzzy subsequence match, best score first, capped so a large
+                // workspace can't render a giant menu.
+                let mut scored: Vec<(i32, &String)> = self
+                    .file_completions
                     .iter()
-                    .filter(|f| f.to_lowercase().contains(&q))
-                    .map(|f| MenuItem {
+                    .filter_map(|f| fuzzy_score(f, &q).map(|s| (s, f)))
+                    .collect();
+                scored.sort_by(|a, b| {
+                    b.0.cmp(&a.0)
+                        .then_with(|| a.1.len().cmp(&b.1.len()))
+                        .then_with(|| a.1.cmp(b.1))
+                });
+                scored
+                    .into_iter()
+                    .take(AT_MENU_MAX)
+                    .map(|(_, f)| MenuItem {
                         value: f.clone(),
                         description: String::new(),
                     })
@@ -361,8 +442,15 @@ impl Composer {
                 let chars: Vec<char> = self.lines[self.cursor_line].chars().collect();
                 let before: String = chars[..at_pos].iter().collect();
                 let after: String = chars[self.cursor_col.min(chars.len())..].iter().collect();
-                self.lines[self.cursor_line] = format!("{before}@{} {after}", item.value);
-                self.cursor_col = at_pos + 1 + item.value.chars().count() + 1;
+                // Quote names with spaces so a `@"my file.png"` reference parses
+                // as one token downstream.
+                let value = if item.value.contains(' ') {
+                    format!("\"{}\"", item.value)
+                } else {
+                    item.value.clone()
+                };
+                self.lines[self.cursor_line] = format!("{before}@{value} {after}");
+                self.cursor_col = at_pos + 1 + value.chars().count() + 1;
             }
         }
         self.menu_selected = 0;

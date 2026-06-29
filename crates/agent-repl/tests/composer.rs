@@ -379,6 +379,26 @@ fn slash_query_filters_menu() {
 }
 
 #[test]
+fn set_slash_commands_overrides_the_menu_catalog() {
+    let mut c = Composer::new();
+    // A host app advertises ITS own commands instead of the built-in demo set.
+    c.set_slash_commands(vec![
+        ("/mode".into(), "Switch the active mode".into()),
+        ("/verify".into(), "Toggle the verified executor".into()),
+        ("/new".into(), "Start a new session".into()),
+    ]);
+    type_str(&mut c, "/");
+    let all: Vec<String> = c.menu_items().into_iter().map(|i| i.value).collect();
+    assert_eq!(all, vec!["/mode", "/verify", "/new"]);
+    // Filtering applies to the custom catalog, not the built-in one.
+    type_str(&mut c, "mo");
+    let filtered = c.menu_items();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].value, "/mode");
+    assert_eq!(filtered[0].description, "Switch the active mode");
+}
+
+#[test]
 fn arrow_keys_move_menu_selection() {
     let mut c = Composer::new();
     type_str(&mut c, "/");
@@ -534,4 +554,43 @@ fn reserved_right_round_trips() {
     assert_eq!(c.reserved_right(), 0);
     c.set_reserved_right(9);
     assert_eq!(c.reserved_right(), 9);
+}
+
+// -----------------------------------------------------------------------------
+// @file fuzzy completion
+// -----------------------------------------------------------------------------
+
+#[test]
+fn at_menu_opens_only_when_file_pool_is_populated() {
+    let mut c = Composer::new();
+    type_str(&mut c, "see @ma");
+    assert_eq!(c.menu_kind(), None, "no @ menu without a file pool");
+    c.set_file_completions(vec!["src/main.rs".into()]);
+    assert_eq!(c.menu_kind(), Some(MenuKind::At));
+}
+
+#[test]
+fn at_menu_fuzzy_matches_subsequence_and_ranks_best_first() {
+    let mut c = Composer::new();
+    c.set_file_completions(vec![
+        "src/main.rs".into(),
+        "src/composer/state.rs".into(),
+        "To do list.png".into(),
+        "README.md".into(),
+    ]);
+    type_str(&mut c, "look at @tdl");
+    let items = c.menu_items();
+    // "tdl" is a subsequence of "to do list.png" only.
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].value, "To do list.png");
+}
+
+#[test]
+fn at_menu_accept_quotes_a_spaced_filename() {
+    let mut c = Composer::new();
+    c.set_file_completions(vec!["To do list.png".into()]);
+    type_str(&mut c, "see @tdl");
+    // Tab accepts the top fuzzy match.
+    assert_eq!(c.handle_key(KeyCode::Tab, KeyModifiers::NONE), ComposerAction::Consumed);
+    assert_eq!(c.lines()[0], "see @\"To do list.png\" ");
 }

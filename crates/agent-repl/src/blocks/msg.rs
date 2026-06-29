@@ -96,10 +96,14 @@ pub fn reasoning(text: &str, ms: Option<u32>, default_open: bool, theme: &Theme)
     out
 }
 
-pub fn status(text: &str, theme: &Theme, spinner_frame: char) -> Vec<Line<'static>> {
+pub fn status(text: &str, theme: &Theme, _spinner_frame: char) -> Vec<Line<'static>> {
     let p = &theme.palette;
+    // A STATIC sigil — a status line is a persistent transcript entry (e.g.
+    // "switched to accept-edits mode"), NOT live progress, so it must not animate
+    // with the spinner clock (that made every status message appear to spin
+    // forever). The live spinner lives only on the dedicated working line.
     vec![Line::from(vec![
-        Span::styled(format!("{} ", spinner_frame), fg(p.accent)),
+        Span::styled("· ".to_string(), fg(p.accent)),
         Span::styled(text.to_string(), fg(p.text_dim)),
     ])]
 }

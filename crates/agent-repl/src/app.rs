@@ -74,6 +74,12 @@ pub struct AgentRepl {
     mascot_state: MascotState,
     // Sticky task-list panel above the working line (empty ⇒ hidden).
     tasks: Vec<TodoItem>,
+    // When the current turn started working — drives the live `(Ns …)` timer on
+    // the working line. `None` while idle.
+    work_started: Option<Instant>,
+    // Driver-supplied working-line activity detail (e.g. `"↓ 1.8k tokens"`),
+    // shown after the timer. Cleared when work stops.
+    activity: Option<String>,
 }
 
 impl std::fmt::Debug for AgentRepl {
@@ -125,6 +131,8 @@ impl AgentRepl {
             mascot: None,
             mascot_state: MascotState::Idle,
             tasks: Vec::new(),
+            work_started: None,
+            activity: None,
         };
         (app, handle)
     }
@@ -165,6 +173,16 @@ impl AgentRepl {
     /// Real apps can refresh this dynamically as the working tree changes.
     pub fn with_file_completions(mut self, files: Vec<String>) -> Self {
         self.composer.set_file_completions(files);
+        self
+    }
+
+    /// Provide the slash-command catalog shown by the `/` menu, as
+    /// `(command, description)` pairs (e.g. `("/mode", "Switch the mode")`; the
+    /// leading `/` is included). Overrides the built-in demo list so the menu
+    /// reflects the host app's OWN commands. Without this, the kit's placeholder
+    /// [`SLASH_COMMANDS`](crate::composer::SLASH_COMMANDS) are shown.
+    pub fn with_slash_commands(mut self, commands: Vec<(String, String)>) -> Self {
+        self.composer.set_slash_commands(commands);
         self
     }
 
@@ -239,6 +257,15 @@ impl AgentRepl {
             Msg::SetWorking(w) => {
                 self.working = w;
                 self.composer.set_working(w);
+                // Start the working-line timer on the leading edge (keep an
+                // already-running clock so a mid-turn `set_working(true)` doesn't
+                // reset it); stop clears the timer + activity detail.
+                if w {
+                    self.work_started.get_or_insert_with(Instant::now);
+                } else {
+                    self.work_started = None;
+                    self.activity = None;
+                }
                 // Auto-drive the mascot: start working → Thinking (unless the
                 // driver already set a richer active state); stop → back to Idle.
                 if w {
@@ -259,6 +286,10 @@ impl AgentRepl {
             }
             Msg::SetMascotState(state) => self.mascot_state = state,
             Msg::SetTasks(tasks) => self.tasks = tasks,
+            Msg::SetModel(model) => self.composer.set_model(model),
+            Msg::SetBranch(branch) => self.composer.set_branch(branch),
+            Msg::SetTokens(tokens) => self.composer.set_tokens(tokens),
+            Msg::SetActivity(detail) => self.activity = detail,
         }
     }
 
@@ -297,8 +328,9 @@ impl AgentRepl {
         }
 
         // Esc while the agent is working OR an approval prompt / question form
-        // is up emits an ABORT signal instead of quitting. (Esc on
-        // an idle, empty composer still quits — that path is unchanged below.)
+        // is up emits an ABORT signal. Otherwise Esc dismisses an open menu /
+        // clears the composer (handled by the composer below) and, on an idle
+        // empty composer, does nothing — it never quits the app (quit is ^C / F10).
         if matches!(code, KeyCode::Esc)
             && !mods.contains(KeyModifiers::CONTROL)
             && (self.working || self.approval.is_some() || self.questions.is_some())
@@ -367,6 +399,10 @@ impl AgentRepl {
                 self.stream.push(agent_repl_core::Event::user(text.clone()));
                 self.working = true;
                 self.composer.set_working(true);
+                // Start the elapsed-turn clock the instant the user sends, before
+                // the driver's own `set_working(true)` echoes back.
+                self.work_started = Some(Instant::now());
+                self.activity = None;
                 let _ = self.input_tx.send(text);
                 return false;
             }
@@ -380,7 +416,11 @@ impl AgentRepl {
         let cur = self.active().scroll_offset(h, vh);
 
         match code {
-            KeyCode::Esc => return true, // composer was empty
+            // Esc never quits the app. While working / a prompt is up it aborts
+            // (handled above); on an idle, empty composer it is a deliberate no-op
+            // so a stray double-tap can't drop the user out of the session. Quit is
+            // Ctrl-C (or F10) — the documented exit in the status bar.
+            KeyCode::Esc => {}
             KeyCode::F(1) => self.theme = self.theme.cycle_vibe(),
             KeyCode::F(2) => self.theme = self.theme.toggle_mode(),
             KeyCode::F(3) => self.theme = self.theme.cycle_tool_style(),
@@ -507,7 +547,7 @@ impl AgentRepl {
             return;
         }
         let p = &self.theme.palette;
-        let line = Line::from(vec![
+        let mut spans = vec![
             Span::raw("  ".to_string()),
             Span::styled(
                 format!("{spinner_frame} "),
@@ -517,7 +557,19 @@ impl AgentRepl {
                 "Working\u{2026}".to_string(),
                 fg(p.text_dim).add_modifier(Modifier::ITALIC),
             ),
-        ]);
+        ];
+        // Live readout in normal text color: `(37s · ↓ 1.8k tokens)`. The timer
+        // ticks every frame; the activity detail (after the `·`) is whatever the
+        // driver last reported, shown only when present.
+        if let Some(started) = self.work_started {
+            let secs = started.elapsed().as_secs();
+            let detail = match &self.activity {
+                Some(a) => format!(" ({secs}s \u{00B7} {a})"),
+                None => format!(" ({secs}s)"),
+            };
+            spans.push(Span::styled(detail, fg(p.text)));
+        }
+        let line = Line::from(spans);
         // Match the transcript ("threads") background, not the raised composer
         // panel — otherwise this line reads as part of the input box.
         frame.render_widget(
