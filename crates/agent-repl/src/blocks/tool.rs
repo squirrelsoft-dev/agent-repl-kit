@@ -6,7 +6,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::blocks::bodies::{
-    bash_body, diff_body, list_body, read_body, search_body, todo_body, tool_summary, web_body,
+    bash_body, diff_body, info_body, list_body, read_body, search_body, todo_body, tool_summary,
+    web_body,
 };
 use crate::blocks::frame;
 use crate::style::{color, fg};
@@ -54,6 +55,7 @@ fn body_for(kind: &ToolKind, palette: &Palette) -> Vec<Line<'static>> {
         ToolKind::Read { path, lines, preview } => read_body(path, *lines, preview, palette),
         ToolKind::Todo { items } => todo_body(items, palette),
         ToolKind::Web { url, summary } => web_body(url, summary.as_deref(), palette),
+        ToolKind::Info { detail, output } => info_body(detail, output, palette),
     }
 }
 

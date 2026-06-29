@@ -143,6 +143,24 @@ pub fn web_body(url: &str, summary: Option<&str>, palette: &Palette) -> Vec<Line
     out
 }
 
+/// Generic body for a tool with no dedicated component: an optional one-line
+/// call detail (e.g. compact args), then the result text — no `$` shell framing
+/// (that's what `bash_body` is for). Keeps an unmapped tool readable as a plain
+/// info block.
+pub fn info_body(detail: &str, output: &str, palette: &Palette) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    if !detail.is_empty() {
+        out.push(Line::from(Span::styled(detail.to_string(), fg(palette.text_dim))));
+    }
+    if !output.is_empty() {
+        let pre = fg_bg(palette.text_dim, palette.bg_inset);
+        for raw in output.split('\n') {
+            out.push(Line::from(Span::styled(raw.to_string(), pre)));
+        }
+    }
+    out
+}
+
 pub fn tool_summary(call: &agent_repl_core::ToolCall) -> String {
     use agent_repl_core::ToolKind as K;
     match &call.kind {
@@ -160,6 +178,7 @@ pub fn tool_summary(call: &agent_repl_core::ToolCall) -> String {
             format!("{}/{}", done, items.len())
         }
         K::Web { .. } => "fetched".to_string(),
+        K::Info { .. } => String::new(),
     }
 }
 

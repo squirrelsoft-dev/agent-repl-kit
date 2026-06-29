@@ -81,6 +81,7 @@ mod tests {
             ToolKindId::List,
             ToolKindId::Todo,
             ToolKindId::Web,
+            ToolKindId::Info,
         ] {
             let m = tool_meta(id);
             assert!(!m.label.is_empty());

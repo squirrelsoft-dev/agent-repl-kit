@@ -30,5 +30,9 @@ pub const fn tool_meta(kind: ToolKindId) -> ToolMeta {
         ToolKindId::List => ToolMeta { label: "list", hue: HueToken::TList },
         ToolKindId::Todo => ToolMeta { label: "todo", hue: HueToken::TTodo },
         ToolKindId::Web => ToolMeta { label: "fetch", hue: HueToken::TWeb },
+        // Generic fallback kind — neutral label/hue (reuses the search hue
+        // rather than adding a palette color) so an unmapped tool reads as a
+        // plain tool block, not a shell command.
+        ToolKindId::Info => ToolMeta { label: "tool", hue: HueToken::TSearch },
     }
 }

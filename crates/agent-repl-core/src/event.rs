@@ -135,6 +135,17 @@ pub enum ToolKind {
         #[cfg_attr(feature = "serde", serde(default))]
         summary: Option<String>,
     },
+    /// A generic tool with no dedicated component. `detail` is a one-line
+    /// summary of the call (e.g. compact args); `output` is the tool's result
+    /// text. The fallback for any tool the host doesn't map to a richer kind,
+    /// so an unknown tool renders as a neutral info block instead of being
+    /// misframed as a shell command.
+    Info {
+        #[cfg_attr(feature = "serde", serde(default))]
+        detail: String,
+        #[cfg_attr(feature = "serde", serde(default))]
+        output: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -147,6 +158,7 @@ pub enum ToolKindId {
     Bash,
     Todo,
     Web,
+    Info,
 }
 
 impl ToolKind {
@@ -160,6 +172,7 @@ impl ToolKind {
             Self::Bash { .. } => ToolKindId::Bash,
             Self::Todo { .. } => ToolKindId::Todo,
             Self::Web { .. } => ToolKindId::Web,
+            Self::Info { .. } => ToolKindId::Info,
         }
     }
 }
