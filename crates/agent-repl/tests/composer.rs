@@ -44,6 +44,55 @@ fn typing_appends_chars_and_advances_cursor() {
     assert_eq!(c.cursor_col(), 5);
 }
 
+// -----------------------------------------------------------------------------
+// bracketed paste
+// -----------------------------------------------------------------------------
+
+#[test]
+fn single_line_paste_inserts_inline() {
+    let mut c = Composer::new();
+    type_str(&mut c, "foo ");
+    c.paste("bar baz".to_string());
+    assert_eq!(c.text(), "foo bar baz");
+    assert_eq!(c.line_count(), 1);
+}
+
+#[test]
+fn multiline_paste_shows_placeholder_and_expands_on_submit() {
+    let mut c = Composer::new();
+    type_str(&mut c, "see ");
+    c.paste("line one\nline two\nline three".to_string());
+    // Buffer shows a compact one-line placeholder, NOT the raw pasted lines.
+    assert_eq!(c.line_count(), 1);
+    let buffer = c.lines().join("\n");
+    assert!(buffer.contains("[Pasted text #1 +3 lines]"), "buffer: {buffer}");
+    assert!(!buffer.contains("line two"));
+    // On submit, `text()` expands the placeholder back to the full paste.
+    assert_eq!(c.text(), "see line one\nline two\nline three");
+}
+
+#[test]
+fn crlf_paste_is_normalized() {
+    let mut c = Composer::new();
+    c.paste("a\r\nb".to_string());
+    assert_eq!(c.text(), "a\nb");
+}
+
+#[test]
+fn multiple_pastes_each_expand_and_clear_resets() {
+    let mut c = Composer::new();
+    c.paste("x1\nx2".to_string());
+    type_str(&mut c, " and ");
+    c.paste("y1\ny2".to_string());
+    let buffer = c.lines().join("\n");
+    assert!(buffer.contains("[Pasted text #1 +2 lines]"));
+    assert!(buffer.contains("[Pasted text #2 +2 lines]"));
+    assert_eq!(c.text(), "x1\nx2 and y1\ny2");
+    c.clear();
+    assert!(c.is_empty());
+    assert_eq!(c.text(), "");
+}
+
 #[test]
 fn backspace_removes_char_to_left() {
     let mut c = Composer::new();
@@ -142,7 +191,7 @@ fn esc_on_empty_buffer_passes_through() {
 }
 
 #[test]
-fn working_state_allows_editing_and_navigation_but_defers_submit() {
+fn working_state_allows_editing_and_enter_steers_the_running_turn() {
     let mut c = Composer::new();
     c.set_working(true);
 
@@ -155,16 +204,62 @@ fn working_state_allows_editing_and_navigation_but_defers_submit() {
     // `Up` on the first line scrolls the transcript rather than the cursor.
     assert_eq!(c.handle_key(KeyCode::Up, KeyModifiers::NONE), ComposerAction::PassThrough);
 
-    // A plain Enter does NOT submit a new turn while working — it keeps the draft.
-    assert_eq!(c.handle_key(KeyCode::Enter, KeyModifiers::NONE), ComposerAction::Consumed);
-    assert!(!c.is_empty(), "submit is deferred; the draft is preserved");
+    // Enter while working STEERS the running turn (pi-style) — the text is
+    // handed to the host for mid-run injection and the buffer clears.
+    let ComposerAction::Steer(text) = c.handle_key(KeyCode::Enter, KeyModifiers::NONE) else {
+        panic!("expected Steer while working");
+    };
+    assert_eq!(text, "hi");
+    assert!(c.is_empty(), "the steered text left the buffer");
 
-    // Once the agent goes idle, the preserved draft submits normally.
+    // Once the agent goes idle, Enter submits normally again.
     c.set_working(false);
+    type_str(&mut c, "next");
     let ComposerAction::Submit(text) = c.handle_key(KeyCode::Enter, KeyModifiers::NONE) else {
         panic!("expected Submit once idle");
     };
-    assert_eq!(text, "hi");
+    assert_eq!(text, "next");
+}
+
+#[test]
+fn enter_on_empty_buffer_while_working_does_nothing() {
+    let mut c = Composer::new();
+    c.set_working(true);
+    assert_eq!(c.handle_key(KeyCode::Enter, KeyModifiers::NONE), ComposerAction::Consumed);
+}
+
+#[test]
+fn alt_enter_while_working_queues_a_follow_up() {
+    let mut c = Composer::new();
+    c.set_working(true);
+    type_str(&mut c, "after this, run the tests");
+    let ComposerAction::QueueFollowUp(text) =
+        c.handle_key(KeyCode::Enter, KeyModifiers::ALT)
+    else {
+        panic!("expected QueueFollowUp while working");
+    };
+    assert_eq!(text, "after this, run the tests");
+    assert!(c.is_empty(), "the queued text left the buffer");
+}
+
+#[test]
+fn alt_enter_while_idle_is_a_plain_submit() {
+    let mut c = Composer::new();
+    type_str(&mut c, "hello");
+    let ComposerAction::Submit(text) = c.handle_key(KeyCode::Enter, KeyModifiers::ALT) else {
+        panic!("expected Submit while idle");
+    };
+    assert_eq!(text, "hello");
+}
+
+#[test]
+fn shift_enter_still_inserts_a_newline_while_working() {
+    let mut c = Composer::new();
+    c.set_working(true);
+    type_str(&mut c, "line1");
+    assert_eq!(c.handle_key(KeyCode::Enter, KeyModifiers::SHIFT), ComposerAction::Consumed);
+    type_str(&mut c, "line2");
+    assert_eq!(c.text(), "line1\nline2");
 }
 
 #[test]

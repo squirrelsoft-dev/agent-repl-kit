@@ -94,12 +94,23 @@ pub struct Composer {
     /// [`set_slash_commands`](Self::set_slash_commands) to advertise its OWN
     /// commands so the menu matches what the app actually handles.
     pub slash_commands: Vec<(String, String)>,
+    /// Modes shown by the `/mode` picker menu, as `(name, description)` pairs in
+    /// display order. Empty (the default) ⇒ no picker; `/mode` falls back to the
+    /// generic slash menu. A host with modes installs them via
+    /// [`set_mode_completions`](Self::set_mode_completions) so typing `/mode`
+    /// offers a pick-from-a-list menu and Shift+Tab can cycle them.
+    pub mode_completions: Vec<(String, String)>,
     /// Minimum rows the field reserves even when nearly empty (default 1).
     /// Used to make room for a mascot drawn in the right strip.
     min_visible_lines: usize,
     /// Columns reserved on the right of the field (e.g. for a mascot). Text is
     /// laid out in the remaining width, so it can't draw into this strip.
     reserved_right: u16,
+    /// Multi-line/large pastes captured as a single unit (bracketed paste). Each
+    /// shows in the buffer as a compact `[Pasted text #N +L lines]` token so a
+    /// newline in the paste no longer submits and the field stays readable; the
+    /// token is expanded back to the full text on [`text`](Self::text) (submit).
+    pastes: Vec<String>,
 }
 
 impl Default for Composer {
@@ -116,8 +127,10 @@ impl Default for Composer {
             tokens: None,
             file_completions: Vec::new(),
             slash_commands: default_slash_commands(),
+            mode_completions: Vec::new(),
             min_visible_lines: 1,
             reserved_right: 0,
+            pastes: Vec::new(),
         }
     }
 }
@@ -126,6 +139,9 @@ impl Default for Composer {
 pub enum MenuKind {
     Slash,
     At,
+    /// The `/mode` argument picker — lists the host-supplied modes so the user
+    /// selects one from a list instead of typing its name.
+    Mode,
 }
 
 /// One visual (soft-wrapped) row of the field: a half-open char range
@@ -163,6 +179,16 @@ pub enum ComposerAction {
     Consumed,
     /// User pressed Enter on a non-empty buffer — here's the submitted text.
     Submit(String),
+    /// Enter on a non-empty buffer while the agent is WORKING: a steering
+    /// message. The host should inject it into the running turn (delivered at
+    /// the next turn boundary) rather than starting a new turn.
+    Steer(String),
+    /// Alt+Enter on a non-empty buffer while the agent is WORKING: queue the
+    /// message until the current run finishes, then send it as the next turn.
+    QueueFollowUp(String),
+    /// User pressed Shift+Tab on an idle composer (no menu open) — the host
+    /// should cycle to the next mode and reflect it in the branch pill.
+    CycleMode,
     /// Key wasn't claimed by the composer; caller may handle it (e.g. theme
     /// cycling, scroll, quit).
     PassThrough,
@@ -197,6 +223,10 @@ impl Composer {
 
     /// Replace the slash-command catalog shown by the `/` menu. Each entry is
     /// `(command, description)` with the command's leading `/` included.
+    pub fn set_mode_completions(&mut self, modes: Vec<(String, String)>) {
+        self.mode_completions = modes;
+    }
+
     pub fn set_slash_commands(&mut self, commands: Vec<(String, String)>) {
         self.slash_commands = commands;
         self.clamp_menu_selected();
@@ -289,8 +319,16 @@ impl Composer {
     pub fn is_empty(&self) -> bool {
         self.lines.iter().all(|l| l.is_empty())
     }
+    /// The submitted text: the buffer with every `[Pasted text #N +L lines]`
+    /// placeholder expanded back to the full pasted content it stands for. A
+    /// placeholder the user has since deleted simply expands to nothing (its token
+    /// is gone from the buffer), so the paste is dropped — the expected behaviour.
     pub fn text(&self) -> String {
-        self.lines.join("\n")
+        let mut out = self.lines.join("\n");
+        for (i, paste) in self.pastes.iter().enumerate() {
+            out = out.replace(&Self::paste_placeholder(i + 1, paste), paste);
+        }
+        out
     }
 
     pub fn clear(&mut self) {
@@ -298,6 +336,7 @@ impl Composer {
         self.cursor_line = 0;
         self.cursor_col = 0;
         self.menu_selected = 0;
+        self.pastes.clear();
     }
 
     // ---- menu derivation ----
@@ -306,6 +345,17 @@ impl Composer {
     pub fn menu_kind(&self) -> Option<MenuKind> {
         // Slash: single-line buffer that starts with `/`.
         if self.lines.len() == 1 && self.lines[0].starts_with('/') {
+            // `/mode` (alone, or with a partial argument) → the mode picker, when
+            // the host installed a mode list. The first whitespace-delimited word
+            // after `/` must be exactly `mode`, so `/modex` stays a slash query.
+            let rest = &self.lines[0][1..];
+            let cmd = rest.split(' ').next().unwrap_or("");
+            if cmd == "mode"
+                && (rest == "mode" || rest.starts_with("mode "))
+                && !self.mode_completions.is_empty()
+            {
+                return Some(MenuKind::Mode);
+            }
             return Some(MenuKind::Slash);
         }
         // At: cursor inside an `@token` on the current line.
@@ -313,6 +363,12 @@ impl Composer {
             return Some(MenuKind::At);
         }
         None
+    }
+
+    /// The partial mode-name typed after `/mode ` (lowercased), used to filter the
+    /// mode picker. Empty when the buffer is just `/mode`/`/mode `.
+    fn mode_query(&self) -> String {
+        self.lines[0].strip_prefix("/mode").unwrap_or("").trim_start().to_lowercase()
     }
 
     /// Returns `(char_pos_of_@, query_after_@)` if the cursor is inside an
@@ -350,6 +406,17 @@ impl Composer {
                     })
                     .map(|(cmd, desc)| MenuItem {
                         value: cmd.clone(),
+                        description: desc.clone(),
+                    })
+                    .collect()
+            }
+            Some(MenuKind::Mode) => {
+                let q = self.mode_query();
+                self.mode_completions
+                    .iter()
+                    .filter(|(name, _)| name.to_lowercase().starts_with(&q))
+                    .map(|(name, desc)| MenuItem {
+                        value: name.clone(),
                         description: desc.clone(),
                     })
                     .collect()
@@ -437,6 +504,13 @@ impl Composer {
                 self.lines[0] = format!("{} ", item.value);
                 self.cursor_col = self.lines[0].chars().count();
             }
+            MenuKind::Mode => {
+                // Picking a mode applies it: submit `/mode <name>` and clear the
+                // buffer, so the menu doubles as a pick-from-a-list switcher.
+                self.clear();
+                self.menu_selected = 0;
+                return ComposerAction::Submit(format!("/mode {}", item.value));
+            }
             MenuKind::At => {
                 let (at_pos, _) = self.find_at_token().unwrap();
                 let chars: Vec<char> = self.lines[self.cursor_line].chars().collect();
@@ -474,7 +548,7 @@ impl Composer {
         // Menu navigation takes precedence when a menu is open.
         if self.menu_open() {
             match code {
-                KeyCode::Up => {
+                KeyCode::Up | KeyCode::BackTab => {
                     self.menu_prev();
                     return ComposerAction::Consumed;
                 }
@@ -496,12 +570,26 @@ impl Composer {
             }
         }
 
-        // Shift+Enter or Alt+Enter → newline.
-        if code == KeyCode::Enter
-            && (mods.contains(KeyModifiers::SHIFT) || mods.contains(KeyModifiers::ALT))
-        {
+        // Shift+Enter → newline (Alt+Enter now queues a follow-up; see below).
+        if code == KeyCode::Enter && mods.contains(KeyModifiers::SHIFT) {
             self.insert_newline();
             return ComposerAction::Consumed;
+        }
+
+        // Alt+Enter → follow-up queue (pi-style): while the agent is working,
+        // the message waits until the run finishes; while idle it's a plain
+        // submit. Newline stays available on Shift+Enter.
+        if code == KeyCode::Enter && mods.contains(KeyModifiers::ALT) {
+            if self.is_empty() {
+                return ComposerAction::Consumed;
+            }
+            let text = self.text();
+            self.clear();
+            return if self.working {
+                ComposerAction::QueueFollowUp(text)
+            } else {
+                ComposerAction::Submit(text)
+            };
         }
 
         match code {
@@ -510,10 +598,13 @@ impl Composer {
                     return ComposerAction::Consumed;
                 }
                 if self.working {
-                    // The agent is busy: keep the draft rather than submit a new
-                    // turn mid-run. It sends once the user hits Enter after work
-                    // ends (the field is editable throughout).
-                    return ComposerAction::Consumed;
+                    // The agent is busy: Enter STEERS the running turn
+                    // (pi-style) — the text is injected at the next turn
+                    // boundary instead of starting a new turn. Alt+Enter
+                    // queues it for after the run instead.
+                    let text = self.text();
+                    self.clear();
+                    return ComposerAction::Steer(text);
                 }
                 let text = self.text();
                 self.clear();
@@ -571,6 +662,9 @@ impl Composer {
                 self.cursor_col = self.lines[self.cursor_line].chars().count();
                 ComposerAction::Consumed
             }
+            // Shift+Tab on an idle composer (no menu open) cycles the mode. With a
+            // menu open it was already handled above (menu_prev).
+            KeyCode::BackTab => ComposerAction::CycleMode,
             _ => ComposerAction::PassThrough,
         }
     }
@@ -579,7 +673,7 @@ impl Composer {
         // For slash: clear the whole buffer. For at: remove the @token under
         // cursor. The user just hit Esc — they're saying "not now".
         match self.menu_kind() {
-            Some(MenuKind::Slash) => self.clear(),
+            Some(MenuKind::Slash) | Some(MenuKind::Mode) => self.clear(),
             Some(MenuKind::At) => {
                 if let Some((at_pos, _)) = self.find_at_token() {
                     let chars: Vec<char> = self.lines[self.cursor_line].chars().collect();
@@ -612,6 +706,42 @@ impl Composer {
         self.cursor_line += 1;
         self.cursor_col = 0;
         self.after_edit();
+    }
+
+    /// Insert a NEWLINE-FREE string at the cursor (a single-line paste, or a
+    /// placeholder token). Callers that may carry newlines must go through
+    /// [`paste`](Self::paste) / [`insert_newline`](Self::insert_newline) instead.
+    fn insert_str(&mut self, s: &str) {
+        let line = &mut self.lines[self.cursor_line];
+        let byte_pos = char_idx_to_byte(line, self.cursor_col);
+        line.insert_str(byte_pos, s);
+        self.cursor_col += s.chars().count();
+        self.after_edit();
+    }
+
+    /// Handle a bracketed paste. A single-line paste is inserted inline; a
+    /// MULTI-LINE paste is captured as one unit and shown as a compact
+    /// `[Pasted text #N +L lines]` placeholder (expanded back on submit — see
+    /// [`text`](Self::text)), so a newline inside the paste no longer submits the
+    /// turn early and a big paste doesn't flood the field. Accepted even while the
+    /// agent works — it just joins the draft, which sends once work ends.
+    pub fn paste(&mut self, text: String) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if !text.contains('\n') {
+            self.insert_str(&text);
+            return;
+        }
+        self.pastes.push(text);
+        let token = Self::paste_placeholder(self.pastes.len(), self.pastes.last().unwrap());
+        self.insert_str(&token);
+    }
+
+    /// The compact placeholder token shown in the buffer for the `n`-th (1-based)
+    /// paste. Defined ONCE so [`paste`](Self::paste) (insert) and
+    /// [`text`](Self::text) (expand) always agree on the exact string.
+    fn paste_placeholder(n: usize, paste: &str) -> String {
+        let lines = paste.matches('\n').count() + 1;
+        format!("[Pasted text #{n} +{lines} lines]")
     }
 
     fn backspace(&mut self) {
@@ -689,4 +819,87 @@ impl Composer {
 
 fn char_idx_to_byte(s: &str, idx: usize) -> usize {
     s.char_indices().nth(idx).map(|(b, _)| b).unwrap_or(s.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_modes() -> Composer {
+        let mut c = Composer::new();
+        c.set_mode_completions(vec![
+            ("default".into(), "asks".into()),
+            ("accept-edits".into(), "auto edits".into()),
+            ("auto".into(), "risk-gated".into()),
+            ("plan".into(), "read-only".into()),
+        ]);
+        c
+    }
+
+    /// Type a string into the composer one char at a time (drives the same edit
+    /// path the renderer would).
+    fn type_str(c: &mut Composer, s: &str) {
+        for ch in s.chars() {
+            c.handle_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+    }
+
+    #[test]
+    fn slash_mode_opens_the_mode_picker() {
+        let mut c = with_modes();
+        type_str(&mut c, "/mode");
+        assert_eq!(c.menu_kind(), Some(MenuKind::Mode));
+        // All four modes listed (no filter yet).
+        let items: Vec<String> = c.menu_items().into_iter().map(|i| i.value).collect();
+        assert_eq!(items, ["default", "accept-edits", "auto", "plan"]);
+    }
+
+    #[test]
+    fn mode_picker_filters_by_typed_prefix() {
+        let mut c = with_modes();
+        type_str(&mut c, "/mode a");
+        let items: Vec<String> = c.menu_items().into_iter().map(|i| i.value).collect();
+        // `a` prefixes accept-edits and auto, not default/plan.
+        assert_eq!(items, ["accept-edits", "auto"]);
+    }
+
+    #[test]
+    fn mode_picker_falls_back_to_slash_without_modes() {
+        // No modes installed ⇒ `/mode` is just a slash query, not the picker.
+        let mut c = Composer::new();
+        type_str(&mut c, "/mode");
+        assert_eq!(c.menu_kind(), Some(MenuKind::Slash));
+        // And `/modex` is never the picker even with modes installed.
+        let mut c = with_modes();
+        type_str(&mut c, "/modex");
+        assert_eq!(c.menu_kind(), Some(MenuKind::Slash));
+    }
+
+    #[test]
+    fn accepting_a_mode_submits_the_switch_command() {
+        let mut c = with_modes();
+        type_str(&mut c, "/mode au");
+        // Down to the second match ("auto"), then Tab to accept.
+        c.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        let action = c.handle_key(KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(action, ComposerAction::Submit("/mode auto".into()));
+        assert!(c.is_empty(), "buffer is cleared on submit");
+    }
+
+    #[test]
+    fn shift_tab_on_idle_composer_requests_a_mode_cycle() {
+        let mut c = Composer::new();
+        assert_eq!(c.handle_key(KeyCode::BackTab, KeyModifiers::SHIFT), ComposerAction::CycleMode);
+    }
+
+    #[test]
+    fn shift_tab_navigates_an_open_menu_instead_of_cycling() {
+        let mut c = with_modes();
+        type_str(&mut c, "/mode");
+        // Menu is open → BackTab moves the selection (wraps to the last item), it
+        // does NOT request a mode cycle.
+        let action = c.handle_key(KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(action, ComposerAction::Consumed);
+        assert_eq!(c.menu_selected(), c.menu_items().len() - 1);
+    }
 }

@@ -162,6 +162,7 @@ pub fn render_menu(composer: &Composer, theme: &Theme, frame: &mut Frame, area: 
     let header_label = match kind {
         MenuKind::Slash => "commands",
         MenuKind::At => "files",
+        MenuKind::Mode => "modes",
     };
 
     let block = Block::default()

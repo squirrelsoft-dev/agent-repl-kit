@@ -33,6 +33,8 @@ pub(crate) enum Msg {
     SetTokens(Option<String>),
     // Update the working-line activity detail (`None` ⇒ just the timer).
     SetActivity(Option<String>),
+    // Replace the `/mode` picker's mode list (`(name, description)` pairs).
+    SetModeCompletions(Vec<(String, String)>),
 }
 
 /// Opaque handle to a tool block already in the stream. Used to update it
@@ -50,6 +52,12 @@ pub struct ReplHandle {
     pub(crate) approval_rx: Mutex<mpsc::UnboundedReceiver<ApprovalChoice>>,
     // Completed question-form answers flowing back.
     pub(crate) answers_rx: Mutex<mpsc::UnboundedReceiver<FormAnswers>>,
+    // Shift+Tab "cycle to the next mode" requests from the composer.
+    pub(crate) mode_cycle_rx: Mutex<mpsc::UnboundedReceiver<()>>,
+    // Mid-run messages: Enter-while-working (steer the running turn) and
+    // Alt+Enter-while-working (queue a follow-up for after the run).
+    pub(crate) steer_rx: Mutex<mpsc::UnboundedReceiver<String>>,
+    pub(crate) follow_up_rx: Mutex<mpsc::UnboundedReceiver<String>>,
 }
 
 impl std::fmt::Debug for ReplHandle {
@@ -126,6 +134,22 @@ impl ReplHandle {
     /// value; this lets the driver change it mid-session (e.g. on a model switch).
     pub fn set_model(&self, model: impl Into<String>) {
         let _ = self.tx.send(Msg::SetModel(model.into()));
+    }
+
+    /// Install (or replace) the modes shown by the `/mode` picker menu, as
+    /// `(name, description)` pairs in display order. With a list installed, typing
+    /// `/mode` opens a pick-from-a-list menu and Shift+Tab cycles the modes. An
+    /// empty list disables both (the generic slash menu handles `/mode`).
+    pub fn set_mode_completions(&self, modes: Vec<(String, String)>) {
+        let _ = self.tx.send(Msg::SetModeCompletions(modes));
+    }
+
+    /// Await the next Shift+Tab "cycle mode" request from the composer. `None` if
+    /// the REPL exited. The host decides what "next mode" means and typically calls
+    /// [`Self::set_branch`] to reflect the new mode in the pill.
+    pub async fn recv_mode_cycle(&self) -> Option<()> {
+        let mut rx = self.mode_cycle_rx.lock().await;
+        rx.recv().await
     }
 
     /// Update the footer branch pill at runtime (the `⎇ …` chip); `None` hides it.
@@ -211,6 +235,29 @@ impl ReplHandle {
     pub async fn recv_abort(&self) -> Option<()> {
         let mut rx = self.abort_rx.lock().await;
         rx.recv().await
+    }
+
+    /// Await the next mid-run STEERING message (Enter while the agent is
+    /// working). `None` if the REPL exited. The host injects it into the
+    /// running turn (typically via a queue its harness drains at turn
+    /// boundaries).
+    pub async fn recv_steer(&self) -> Option<String> {
+        let mut rx = self.steer_rx.lock().await;
+        rx.recv().await
+    }
+
+    /// Drain any queued FOLLOW-UP messages (Alt+Enter while working) without
+    /// blocking. The host calls this after a turn finishes and runs each as
+    /// the next prompt. Returns an empty vec when the receiver is busy or
+    /// nothing is queued.
+    pub fn drain_follow_ups(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Ok(mut rx) = self.follow_up_rx.try_lock() {
+            while let Ok(text) = rx.try_recv() {
+                out.push(text);
+            }
+        }
+        out
     }
 
     /// Drop any abort signals queued before a turn started, so a stale Esc

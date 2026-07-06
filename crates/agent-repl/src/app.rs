@@ -7,7 +7,10 @@ use std::time::{Duration, Instant};
 
 use agent_repl_core::{ApprovalChoice, ApprovalPrompt, FormAnswers, Theme, TodoItem};
 use anyhow::Result;
-use crossterm::event::{self, Event as CtEvent, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event as CtEvent, KeyCode, KeyEventKind,
+    KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -69,6 +72,12 @@ pub struct AgentRepl {
     // A tabbed question form + the channel its answers flow out.
     questions: Option<QuestionState>,
     answers_tx: mpsc::UnboundedSender<FormAnswers>,
+    // Shift+Tab "cycle mode" requests flowing out to the driver.
+    mode_cycle_tx: mpsc::UnboundedSender<()>,
+    // Mid-run messages flowing out: Enter-while-working steers the running
+    // turn; Alt+Enter-while-working queues a follow-up for after the run.
+    steer_tx: mpsc::UnboundedSender<String>,
+    follow_up_tx: mpsc::UnboundedSender<String>,
     // Optional mascot drawn in the composer's right strip + its expression.
     mascot: Option<Box<dyn Mascot>>,
     mascot_state: MascotState,
@@ -101,6 +110,9 @@ impl AgentRepl {
         let (abort_tx, abort_rx) = mpsc::unbounded_channel();
         let (approval_tx, approval_rx) = mpsc::unbounded_channel();
         let (answers_tx, answers_rx) = mpsc::unbounded_channel();
+        let (mode_cycle_tx, mode_cycle_rx) = mpsc::unbounded_channel();
+        let (steer_tx, steer_rx) = mpsc::unbounded_channel();
+        let (follow_up_tx, follow_up_rx) = mpsc::unbounded_channel();
         let handle = ReplHandle {
             tx,
             input_rx: Mutex::new(input_rx),
@@ -108,6 +120,9 @@ impl AgentRepl {
             abort_rx: Mutex::new(abort_rx),
             approval_rx: Mutex::new(approval_rx),
             answers_rx: Mutex::new(answers_rx),
+            mode_cycle_rx: Mutex::new(mode_cycle_rx),
+            steer_rx: Mutex::new(steer_rx),
+            follow_up_rx: Mutex::new(follow_up_rx),
         };
         let app = Self {
             theme,
@@ -128,6 +143,9 @@ impl AgentRepl {
             approval_selected: 0,
             questions: None,
             answers_tx,
+            mode_cycle_tx,
+            steer_tx,
+            follow_up_tx,
             mascot: None,
             mascot_state: MascotState::Idle,
             tasks: Vec::new(),
@@ -186,6 +204,16 @@ impl AgentRepl {
         self
     }
 
+    /// Install the modes shown by the `/mode` picker, as `(name, description)`
+    /// pairs in display order. With a list installed, typing `/mode` opens a
+    /// pick-from-a-list menu and Shift+Tab (on an idle composer) cycles the modes;
+    /// the host resolves the cycle via [`ReplHandle::recv_mode_cycle`]. Without it,
+    /// `/mode` falls back to the generic slash menu and Shift+Tab does nothing.
+    pub fn with_mode_completions(mut self, modes: Vec<(String, String)>) -> Self {
+        self.composer.set_mode_completions(modes);
+        self
+    }
+
     // ---- input-sizing + mascot builders ----
 
     /// Force the input field to always show at least `n` rows (it still grows
@@ -241,6 +269,10 @@ impl AgentRepl {
                         }
                     }
                     CtEvent::Resize(_, _) => {}
+                    // Bracketed paste: route the whole paste to the composer, which
+                    // inlines a single line or shows a `[Pasted text …]` placeholder
+                    // for a multi-line paste instead of submitting on each newline.
+                    CtEvent::Paste(text) => self.composer.paste(text),
                     _ => {}
                 }
             }
@@ -290,6 +322,7 @@ impl AgentRepl {
             Msg::SetBranch(branch) => self.composer.set_branch(branch),
             Msg::SetTokens(tokens) => self.composer.set_tokens(tokens),
             Msg::SetActivity(detail) => self.activity = detail,
+            Msg::SetModeCompletions(modes) => self.composer.set_mode_completions(modes),
         }
     }
 
@@ -404,6 +437,27 @@ impl AgentRepl {
                 self.work_started = Some(Instant::now());
                 self.activity = None;
                 let _ = self.input_tx.send(text);
+                return false;
+            }
+            ComposerAction::Steer(text) => {
+                // Enter while the agent is working: steer the running turn.
+                // Mirror into the stream (tagged so the user sees it's a
+                // steer, not a new turn) and forward to recv_steer().
+                self.stream
+                    .push(agent_repl_core::Event::user(format!("(steering) {text}")));
+                let _ = self.steer_tx.send(text);
+                return false;
+            }
+            ComposerAction::QueueFollowUp(text) => {
+                // Alt+Enter while working: hold the message until the run ends.
+                self.stream
+                    .push(agent_repl_core::Event::user(format!("(queued) {text}")));
+                let _ = self.follow_up_tx.send(text);
+                return false;
+            }
+            ComposerAction::CycleMode => {
+                // Shift+Tab on an idle composer: ask the driver to advance the mode.
+                let _ = self.mode_cycle_tx.send(());
                 return false;
             }
             ComposerAction::PassThrough => {}
@@ -694,7 +748,10 @@ impl AgentRepl {
 fn setup_terminal() -> Result<Tui> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    // Bracketed paste: the terminal delivers a paste as ONE `CtEvent::Paste`
+    // instead of a keystroke stream, so a newline inside the paste no longer reads
+    // as an Enter/submit (see the composer's `paste`).
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
     Ok(terminal)
@@ -702,7 +759,7 @@ fn setup_terminal() -> Result<Tui> {
 
 fn restore_terminal(terminal: &mut Tui) -> Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste)?;
     terminal.show_cursor()?;
     Ok(())
 }
