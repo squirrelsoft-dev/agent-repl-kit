@@ -323,6 +323,8 @@ impl AgentRepl {
             Msg::SetTokens(tokens) => self.composer.set_tokens(tokens),
             Msg::SetActivity(detail) => self.activity = detail,
             Msg::SetModeCompletions(modes) => self.composer.set_mode_completions(modes),
+            Msg::ClearTranscript => self.stream.clear(),
+            Msg::SetEditorText(text) => self.composer.set_text(text),
         }
     }
 

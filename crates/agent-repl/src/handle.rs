@@ -35,6 +35,10 @@ pub(crate) enum Msg {
     SetActivity(Option<String>),
     // Replace the `/mode` picker's mode list (`(name, description)` pairs).
     SetModeCompletions(Vec<(String, String)>),
+    // Drop the whole transcript (the host re-renders after a rewind/switch).
+    ClearTranscript,
+    // Replace the composer's buffer (restore unsent input).
+    SetEditorText(String),
 }
 
 /// Opaque handle to a tool block already in the stream. Used to update it
@@ -266,5 +270,23 @@ impl ReplHandle {
         if let Ok(mut rx) = self.abort_rx.try_lock() {
             while rx.try_recv().is_ok() {}
         }
+    }
+
+    /// Drop every transcript block (stream items, tool blocks, scroll, focus).
+    /// For hosts whose conversation state moved somewhere the append-only
+    /// transcript can't represent — a rewind, a branch switch, a clear — so
+    /// they can re-render the new state from scratch instead of appending
+    /// below stale history. Tool handles from before the clear go stale;
+    /// updating one is a silent no-op.
+    pub fn clear_transcript(&self) {
+        let _ = self.tx.send(Msg::ClearTranscript);
+    }
+
+    /// Replace the composer's input buffer with `text`, cursor at the end.
+    /// For restoring unsent input — e.g. steering/follow-up text the user typed
+    /// mid-turn that an Esc-abort would otherwise swallow. Overwrites whatever
+    /// is in the editor.
+    pub fn set_editor_text(&self, text: impl Into<String>) {
+        let _ = self.tx.send(Msg::SetEditorText(text.into()));
     }
 }

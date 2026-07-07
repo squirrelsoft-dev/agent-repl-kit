@@ -339,6 +339,20 @@ impl Composer {
         self.pastes.clear();
     }
 
+    /// Replace the buffer with `text`, cursor at the end — the host restoring
+    /// unsent input (e.g. queued follow-ups after an Esc-abort). Any pasted-text
+    /// placeholders are discarded with the old buffer.
+    pub fn set_text(&mut self, text: impl Into<String>) {
+        self.clear();
+        let text = text.into();
+        self.lines = text.split('\n').map(String::from).collect();
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.cursor_line = self.lines.len() - 1;
+        self.cursor_col = self.lines[self.cursor_line].chars().count();
+    }
+
     // ---- menu derivation ----
 
     /// Which menu (if any) should show given the current buffer state.
@@ -842,6 +856,23 @@ mod tests {
         for ch in s.chars() {
             c.handle_key(KeyCode::Char(ch), KeyModifiers::NONE);
         }
+    }
+
+    #[test]
+    fn set_text_replaces_the_buffer_with_cursor_at_the_end() {
+        let mut c = Composer::new();
+        type_str(&mut c, "old draft");
+        c.set_text("restored line one\nand two");
+        assert_eq!(c.text(), "restored line one\nand two");
+        assert_eq!(c.cursor_line(), 1);
+        assert_eq!(c.cursor_col(), "and two".chars().count());
+        // Typing continues from the end, not the start.
+        type_str(&mut c, "!");
+        assert_eq!(c.text(), "restored line one\nand two!");
+        // Empty text = a plain clear.
+        c.set_text("");
+        assert!(c.is_empty());
+        assert_eq!((c.cursor_line(), c.cursor_col()), (0, 0));
     }
 
     #[test]

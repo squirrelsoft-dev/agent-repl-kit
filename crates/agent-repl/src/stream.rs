@@ -52,6 +52,23 @@ impl Stream {
         }
     }
 
+    /// Drop every item and reset scroll/focus — the host is about to re-render
+    /// the transcript from scratch (a rewind, branch switch, or clear). Stale
+    /// [`ToolId`]s from before the clear are forgotten; a late `update_tool`
+    /// against one is a silent no-op (the map is emptied, not re-pointed).
+    pub fn clear(&mut self) {
+        self.items.clear();
+        self.item_ui.clear();
+        self.tool_index.clear();
+        self.scroll = None;
+        self.focus_idx = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn items(&self) -> &[Event] {
+        &self.items
+    }
+
     // ---- focus navigation (collapsed-style only, but harmless elsewhere) ----
 
     /// Move focus to the next tool item, wrapping. No-op when no tool items.
@@ -203,5 +220,40 @@ impl Stream {
 
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call(name: &str) -> ToolCall {
+        ToolCall::new(
+            name,
+            agent_repl_core::ToolKind::Info { detail: String::new(), output: String::new() },
+        )
+    }
+
+    #[test]
+    fn clear_empties_items_and_forgets_stale_tool_ids() {
+        let mut s = Stream::default();
+        s.push(Event::status("hello"));
+        let id = ToolId(7);
+        s.push_tool(id, call("bash"));
+        s.focus_next();
+        assert_eq!(s.len(), 2);
+
+        s.clear();
+        assert!(s.is_empty());
+        assert!(s.focused_idx().is_none());
+        assert!(s.is_following(), "scroll pin resets to follow-tail");
+
+        // A late update against a pre-clear id must not resurrect or panic.
+        s.update_tool(id, call("bash-done"));
+        assert!(s.is_empty());
+
+        // Fresh content renders from index 0 again.
+        s.push(Event::status("fresh"));
+        assert_eq!(s.items().len(), 1);
     }
 }
